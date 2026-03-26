@@ -1,7 +1,9 @@
 """Top-level pipeline orchestration for gskill."""
 
+from inspect import signature
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 from gepa.optimize_anything import EngineConfig, GEPAConfig, optimize_anything
@@ -15,7 +17,8 @@ from .skill import (
     generate_initial_skill_suite,
     save_skill_suite,
 )
-from .tasks import build_task_bundle
+from . import tasks as task_models
+from .tasks import DEFAULT_TASK_SOURCE, build_task_bundle
 
 
 def _extract_repo_name(repo_url: str) -> str:
@@ -26,6 +29,75 @@ def _extract_repo_name(repo_url: str) -> str:
         return f"{parts[0]}/{parts[1]}"
     # Assume already "owner/repo" or "repo"
     return url
+
+
+def _make_task_bundle_request(
+    repo_name: str,
+    repo_url: str,
+    limit: int,
+    scratch_dir: Path,
+) -> object:
+    """Build the task-source request object expected by repo-native sources."""
+    payload = {
+        "repo_name": repo_name,
+        "repo_url": repo_url,
+        "limit": limit,
+        "scratch_dir": str(scratch_dir),
+    }
+    request_type = getattr(task_models, "TaskSourceRequest", None)
+    if request_type is None:
+        return SimpleNamespace(**payload)
+
+    try:
+        request_params = signature(request_type).parameters
+    except (TypeError, ValueError):
+        request_params = {}
+    if request_params:
+        filtered_payload = {
+            key: value for key, value in payload.items() if key in request_params
+        }
+        return request_type(**filtered_payload)
+    return request_type(**payload)
+
+
+def _build_task_bundle(
+    repo_name: str,
+    repo_url: str,
+    source_names: list[str] | None,
+    limit: int,
+    scratch_dir: Path,
+) -> tuple[object, object, list[str]]:
+    """Call the task bundle builder with either the old or request-based interface."""
+    selected_sources = source_names or [DEFAULT_TASK_SOURCE]
+    request = _make_task_bundle_request(repo_name, repo_url, limit, scratch_dir)
+
+    try:
+        parameters = signature(build_task_bundle).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+
+    if "request" in parameters:
+        kwargs: dict[str, object] = {"request": request}
+        if "source_names" in parameters:
+            kwargs["source_names"] = selected_sources
+        bundle = build_task_bundle(**kwargs)
+        return bundle, request, selected_sources
+
+    if "task_source_request" in parameters:
+        kwargs = {"task_source_request": request}
+        if "source_names" in parameters:
+            kwargs["source_names"] = selected_sources
+        bundle = build_task_bundle(**kwargs)
+        return bundle, request, selected_sources
+
+    kwargs: dict[str, object] = {
+        "repo_name": repo_name,
+        "source_names": selected_sources,
+    }
+    if "limit" in parameters:
+        kwargs["limit"] = limit
+    bundle = build_task_bundle(**kwargs)
+    return bundle, request, selected_sources
 
 
 def evaluate_holdout(
@@ -164,10 +236,18 @@ def run(
         }
 
     print("[gskill] Loading tasks from task sources...")
+    selected_sources = task_sources or [DEFAULT_TASK_SOURCE]
+    task_bundle_repo_url = target_work_area or repo_url
+    task_bundle_limit = 300
+    task_bundle_scratch_dir = Path("scratchpad") / "task-bundles" / target_repo_name.replace("/", "__")
+    print(f"[gskill] Task sources: {', '.join(selected_sources)}")
     try:
-        task_bundle = build_task_bundle(
+        task_bundle, _task_bundle_request, selected_sources = _build_task_bundle(
             repo_name=target_repo_name,
+            repo_url=task_bundle_repo_url,
             source_names=task_sources,
+            limit=task_bundle_limit,
+            scratch_dir=task_bundle_scratch_dir,
         )
     except ValueError as exc:
         if allow_missing_tasks:
@@ -192,6 +272,11 @@ def run(
         raise
     train, val, test = task_bundle.train, task_bundle.val, task_bundle.test
     print(f"[gskill] Tasks: {len(train)} train / {len(val)} val / {len(test)} test")
+    print(
+        "[gskill] Task bundle context: "
+        f"repo={target_repo_name} source={task_bundle_repo_url} "
+        f"scratch={task_bundle_scratch_dir}"
+    )
 
     evaluator = make_evaluator(agent_model=agent_model)
     seed_candidate = skill_suite.primary.content if skill_suite else None
@@ -286,7 +371,14 @@ def run(
         "task_bundle": {
             **task_bundle.provenance,
             "rejections": task_bundle.rejections,
+            "request": {
+                "repo_name": target_repo_name,
+                "repo_url": task_bundle_repo_url,
+                "limit": task_bundle_limit,
+                "scratch_dir": str(task_bundle_scratch_dir),
+            },
         },
+        "task_sources": selected_sources,
         "best_val_score": best_score,
         "seed_used": seed_candidate is not None,
         "augment_suite": augment_suite,

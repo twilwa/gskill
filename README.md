@@ -21,7 +21,7 @@ It implements the pipeline described in the [GEPA blog post](https://gepa-ai.git
 
 1. Reads a source corpus repository and generates an initial workflow skill from its README plus high-signal repo files
 2. Optionally treats a different repository as the target work area via `--target-work-area`
-3. Builds a canonical task bundle from one or more task sources for the target work area
+3. Builds a canonical task bundle from one or more task sources for the target work area, passing repo-location context so repo-native sources can materialize the checkout they need
 4. Uses [GEPA](https://github.com/gepa-ai/gepa)'s `optimize_anything` to iteratively refine the primary workflow skill through evolutionary search
 5. Runs an augmentation pass to generate companion skills grounded in the source corpus
 6. Can evaluate the best candidate on a holdout test split
@@ -124,7 +124,7 @@ The optimized skill is written to:
 ```
 
 The primary skill is always the root `SKILL.md`. The companion skills are additional capabilities extracted from the source corpus and listed in `skill-suite.json`.
-`run-report.json` records the run configuration, task-bundle provenance, validation score, and optional holdout test summary.
+`run-report.json` records the run configuration, task-bundle provenance, repo-location context, validation score, and optional holdout test summary.
 
 ## Task runner
 

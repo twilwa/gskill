@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import subprocess
+
 from src.evaluator import _build_test_command, make_evaluator
 from src.tasks import EnvironmentSpec, TaskSpec, VerifierSpec
 
@@ -41,7 +44,7 @@ def test_evaluator_reports_unsupported_runner_for_non_swebench_tasks():
         repo_name="acme/commerce-api",
         problem_statement="Run the local verification command.",
         environment=EnvironmentSpec(kind="local_checkout", ref="HEAD"),
-        verifier=VerifierSpec(kind="shell_command", commands=("mise run check",)),
+        verifier=VerifierSpec(kind="test_selectors", selectors=["tests/test_app.py::test_case"]),
         metadata={},
     )
 
