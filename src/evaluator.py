@@ -15,6 +15,7 @@ import gepa.optimize_anything as oa
 import yaml
 from minisweagent.agents import get_agent
 from minisweagent.config import builtin_config_dir, get_config_from_spec
+from minisweagent.environments import get_environment
 from minisweagent.models import get_model
 from minisweagent.run.benchmarks.swebench import (
     get_sb_environment,
@@ -25,6 +26,8 @@ from minisweagent.utils.serialize import recursive_merge
 from .tasks import TaskSpec
 
 _SWEBENCH_CONFIG = builtin_config_dir / "benchmarks" / "swebench.yaml"
+_LOCAL_CHECKOUT_ENV_KIND = "local_checkout"
+_LOCAL_CHECKOUT_VERIFIER_KIND = "shell_command"
 
 # Base system prompt that frames the skill content
 _SYSTEM_PREFIX = (
