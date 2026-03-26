@@ -18,7 +18,9 @@ from datasets import load_dataset
 DATASET_NAME = "SWE-bench/SWE-smith"
 DEFAULT_TASK_SOURCE = "swe-smith"
 PYTHON_MUTATION_TASK_SOURCE = "python-mutation"
+PYTHON_HISTORY_REPLAY_TASK_SOURCE = "python-history-replay"
 DEFAULT_COMMAND_TIMEOUT = 120
+DEFAULT_HISTORY_SCAN_LIMIT = 40
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,16 @@ class PythonMutationCandidate:
     line: int
 
 
+@dataclass(frozen=True)
+class PythonHistoryCandidate:
+    """A replayable fix commit discovered from Python repository history."""
+
+    commit: str
+    parent: str
+    subject: str
+    changed_paths: tuple[str, ...]
+
+
 class TaskSource(Protocol):
     """Collect tasks for a repository from a named source."""
 
@@ -151,7 +163,11 @@ def _run_shell_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_T
     )
 
 
-def _materialize_repo_checkout(request: TaskSourceRequest) -> Path:
+def _materialize_repo_checkout(
+    request: TaskSourceRequest,
+    *,
+    require_history: bool = False,
+) -> Path:
     """Materialize the repository checkout used by repo-native sources."""
 
     if request.checkout_path:
@@ -167,16 +183,20 @@ def _materialize_repo_checkout(request: TaskSourceRequest) -> Path:
             return local_path.resolve()
 
         scratch_root = _ensure_scratch_dir(request)
-        repo_root = scratch_root / f"{_repo_slug(request.repo_name)}-source"
+        clone_suffix = "history-source" if require_history else "source"
+        repo_root = scratch_root / f"{_repo_slug(request.repo_name)}-{clone_suffix}"
         if repo_root.exists():
             return repo_root
+        clone_command = "git clone" if require_history else "git clone --depth 1"
         result = _run_shell_command(
-            f"git clone --depth 1 {repo_url} {repo_root}",
+            f"{clone_command} {repo_url} {repo_root}",
             cwd=scratch_root,
             timeout=DEFAULT_COMMAND_TIMEOUT,
         )
         if result.returncode != 0:
-            raise ValueError(f"Could not clone repository for mutation tasks: {result.stdout.strip()}")
+            raise ValueError(
+                f"Could not clone repository for task generation: {result.stdout.strip()}"
+            )
         return repo_root
 
     raise ValueError(
@@ -216,6 +236,24 @@ def _python_source_files(repo_root: Path) -> list[Path]:
             continue
         files.append(path)
     return sorted(files)
+
+
+def _is_python_implementation_path(path: str) -> bool:
+    """Return True when a changed path looks like a Python implementation file."""
+
+    relative_path = Path(path)
+    if relative_path.suffix != ".py":
+        return False
+    excluded_parts = {".git", ".venv", "__pycache__", "tests", "bootstrap"}
+    return not (excluded_parts & set(relative_path.parts))
+
+
+def _is_replayable_commit_shape(changed_paths: tuple[str, ...]) -> bool:
+    """Return True when a history-replay commit only changes Python implementation files."""
+
+    return bool(changed_paths) and all(
+        _is_python_implementation_path(path) for path in changed_paths
+    )
 
 
 def _slice_offsets(source: str, node: ast.AST) -> tuple[int, int]:
@@ -323,6 +361,14 @@ def _task_snapshot_root(request: TaskSourceRequest, scratch_root: Path) -> Path:
     return snapshot_root
 
 
+def _history_snapshot_root(request: TaskSourceRequest, scratch_root: Path) -> Path:
+    """Return the directory where accepted history-replay snapshots are stored."""
+
+    snapshot_root = scratch_root / f"{_repo_slug(request.repo_name)}-history-snapshots"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    return snapshot_root
+
+
 def _copy_checkout(repo_root: Path, destination: Path) -> Path:
     """Copy a repository checkout to a destination path."""
 
@@ -339,6 +385,117 @@ def _mutation_task_id(request: TaskSourceRequest, candidate: PythonMutationCandi
         f"{request.repo_name}:{candidate.relative_path}:{candidate.line}:{candidate.description}".encode()
     ).hexdigest()[:10]
     return f"python-mutation-{fingerprint}"
+
+
+def _history_task_id(request: TaskSourceRequest, candidate: PythonHistoryCandidate) -> str:
+    """Create a stable task id for a history replay candidate."""
+
+    fingerprint = hashlib.sha1(
+        f"{request.repo_name}:{candidate.commit}:{candidate.parent}".encode()
+    ).hexdigest()[:10]
+    return f"python-history-replay-{fingerprint}"
+
+
+def _git_output(repo_root: Path, arguments: list[str], *, strip: bool = True) -> str:
+    """Run a git command and return stdout or raise a source-specific error."""
+
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *arguments],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=DEFAULT_COMMAND_TIMEOUT,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise ValueError(f"Git history inspection failed for {repo_root}: {stderr}")
+    return result.stdout.strip() if strip else result.stdout
+
+
+def _looks_like_fix_commit(subject: str) -> bool:
+    """Return True when a commit subject looks like a bug fix."""
+
+    lowered = subject.lower()
+    return any(token in lowered for token in ("fix", "bug", "regress", "repair", "correct"))
+
+
+def _python_history_candidates(
+    repo_root: Path,
+    *,
+    scan_limit: int,
+) -> list[PythonHistoryCandidate]:
+    """Collect replayable Python fix commits from recent repository history."""
+
+    commit_lines = _git_output(
+        repo_root,
+        ["rev-list", "--first-parent", "--max-count", str(scan_limit), "HEAD"],
+    ).splitlines()
+
+    candidates: list[PythonHistoryCandidate] = []
+    for commit in commit_lines:
+        parents = _git_output(repo_root, ["show", "--quiet", "--format=%P", commit]).split()
+        if len(parents) != 1:
+            continue
+
+        subject = _git_output(repo_root, ["show", "--quiet", "--format=%s", commit])
+        if not _looks_like_fix_commit(subject):
+            continue
+
+        changed_paths = tuple(
+            path
+            for path in _git_output(
+                repo_root,
+                ["diff-tree", "--no-commit-id", "--name-only", "-r", commit],
+            ).splitlines()
+            if path
+        )
+        if not _is_replayable_commit_shape(changed_paths):
+            continue
+
+        candidates.append(
+            PythonHistoryCandidate(
+                commit=commit,
+                parent=parents[0],
+                subject=subject,
+                changed_paths=changed_paths,
+            )
+        )
+    return candidates
+
+
+def _checkout_commit_snapshot(repo_root: Path, commit: str, destination: Path) -> Path:
+    """Copy a repository checkout and reset it to a specific commit."""
+
+    snapshot_root = _copy_checkout(repo_root, destination)
+    command = (
+        f"git checkout --quiet {shlex.quote(commit)} "
+        f"&& git reset --hard --quiet {shlex.quote(commit)} "
+        "&& git clean -fdq"
+    )
+    result = _run_shell_command(command, cwd=snapshot_root)
+    if result.returncode != 0:
+        raise ValueError(
+            f"Could not materialize commit {commit} for {repo_root}: {result.stdout.strip()}"
+        )
+    return snapshot_root
+
+
+def _reverse_commit_patch(snapshot_root: Path, patch_text: str) -> bool:
+    """Reverse-apply a commit patch into an exported snapshot."""
+
+    result = subprocess.run(
+        ["patch", "-R", "-p1"],
+        cwd=str(snapshot_root),
+        input=patch_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=DEFAULT_COMMAND_TIMEOUT,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return result.returncode == 0
 
 
 class SweSmithSource:
@@ -449,9 +606,104 @@ class PythonMutationSource:
         return accepted
 
 
+class PythonHistoryReplaySource:
+    """Collect repo-native replay tasks from validated Python fix commits."""
+
+    name = PYTHON_HISTORY_REPLAY_TASK_SOURCE
+
+    def collect(self, request: TaskSourceRequest | str, limit: int = 300) -> list[TaskSpec]:
+        if isinstance(request, str):
+            request = TaskSourceRequest(repo_name=request, limit=limit)
+
+        repo_root = _materialize_repo_checkout(request, require_history=True)
+        verifier_command = _discover_python_verifier_command(repo_root)
+        scratch_root = _ensure_scratch_dir(request)
+        snapshot_root = _history_snapshot_root(request, scratch_root)
+        scan_limit = max(request.limit * 5, DEFAULT_HISTORY_SCAN_LIMIT)
+        candidates = _python_history_candidates(repo_root, scan_limit=scan_limit)
+        if not candidates:
+            raise ValueError(
+                f"No replayable Python fix commits found for {request.repo_name}."
+            )
+
+        accepted: list[TaskSpec] = []
+        for index, candidate in enumerate(candidates):
+            if len(accepted) >= request.limit:
+                break
+
+            snapshot_path = _checkout_commit_snapshot(
+                repo_root,
+                candidate.commit,
+                snapshot_root / f"candidate-{index}-{candidate.commit[:8]}",
+            )
+            baseline = _run_shell_command(verifier_command, cwd=snapshot_path)
+            if baseline.returncode != 0:
+                shutil.rmtree(snapshot_path, ignore_errors=True)
+                continue
+
+            patch_text = _git_output(
+                repo_root,
+                ["show", "--binary", "--format=", candidate.commit],
+                strip=False,
+            )
+            if not patch_text.strip():
+                shutil.rmtree(snapshot_path, ignore_errors=True)
+                continue
+            if not _reverse_commit_patch(snapshot_path, patch_text):
+                shutil.rmtree(snapshot_path, ignore_errors=True)
+                continue
+
+            broken = _run_shell_command(verifier_command, cwd=snapshot_path)
+            if broken.returncode == 0:
+                shutil.rmtree(snapshot_path, ignore_errors=True)
+                continue
+
+            accepted.append(
+                TaskSpec(
+                    id=_history_task_id(request, candidate),
+                    family="history_replay",
+                    source=PYTHON_HISTORY_REPLAY_TASK_SOURCE,
+                    repo_name=request.repo_name,
+                    problem_statement=(
+                        "A previously fixed regression has been reintroduced from repository history. "
+                        f"Restore behavior in {', '.join(candidate.changed_paths)} without editing tests. "
+                        f"Validate the fix with `{verifier_command}`."
+                    ),
+                    environment=EnvironmentSpec(
+                        kind="local_checkout",
+                        ref=str(snapshot_path),
+                        timeout_seconds=DEFAULT_COMMAND_TIMEOUT,
+                    ),
+                    verifier=VerifierSpec(
+                        kind="shell_command",
+                        commands=(verifier_command,),
+                        timeout_seconds=DEFAULT_COMMAND_TIMEOUT,
+                    ),
+                    metadata={
+                        "repo_url": request.repo_url,
+                        "history_replay": {
+                            "fixed_commit": candidate.commit,
+                            "parent_commit": candidate.parent,
+                            "subject": candidate.subject,
+                            "changed_paths": list(candidate.changed_paths),
+                        },
+                        "verifier_output_tail": broken.stdout[-500:],
+                    },
+                    mutable_paths=candidate.changed_paths,
+                )
+            )
+
+        if not accepted:
+            raise ValueError(
+                f"Could not generate validated Python history replay tasks for {request.repo_name} using '{verifier_command}'."
+            )
+        return accepted
+
+
 _TASK_SOURCES: dict[str, TaskSource] = {
     DEFAULT_TASK_SOURCE: SweSmithSource(),
     PYTHON_MUTATION_TASK_SOURCE: PythonMutationSource(),
+    PYTHON_HISTORY_REPLAY_TASK_SOURCE: PythonHistoryReplaySource(),
 }
 
 
@@ -524,16 +776,31 @@ def build_task_bundle(
         source_counts[source_name] = len(source_tasks)
 
     train_tasks, val_tasks, test_tasks = split_tasks(collected, train=train, val=val)
+    provenance = {
+        "source_counts": source_counts,
+        "sources": list(source_counts),
+        "repo_url": repo_url,
+        "checkout_path": checkout_path,
+    }
+    if PYTHON_MUTATION_TASK_SOURCE in source_counts:
+        mutation_provenance = {"kind": "python"}
+        if repo_url:
+            mutation_provenance["repo_url"] = repo_url
+        if checkout_path:
+            mutation_provenance["checkout_path"] = checkout_path
+        provenance["mutation_source"] = mutation_provenance
+    if PYTHON_HISTORY_REPLAY_TASK_SOURCE in source_counts:
+        history_replay_provenance = {"kind": "python"}
+        if repo_url:
+            history_replay_provenance["repo_url"] = repo_url
+        if checkout_path:
+            history_replay_provenance["checkout_path"] = checkout_path
+        provenance["history_replay_source"] = history_replay_provenance
     return TaskBundle(
         tasks=collected,
         train=list(train_tasks),
         val=list(val_tasks),
         test=list(test_tasks),
-        provenance={
-            "source_counts": source_counts,
-            "sources": list(source_counts),
-            "repo_url": repo_url,
-            "checkout_path": checkout_path,
-        },
+        provenance=provenance,
         rejections=rejections,
     )
