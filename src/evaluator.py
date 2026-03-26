@@ -118,6 +118,84 @@ def _task_environment_commands(task: TaskSpec | dict, field_name: str) -> tuple[
     return ()
 
 
+def _task_timeout_value(spec: object, field_name: str) -> int | None:
+    """Read a timeout value from dataclass or dict metadata."""
+
+    if spec is None:
+        return None
+    if isinstance(spec, dict):
+        value = spec.get(field_name)
+    else:
+        value = getattr(spec, field_name, None)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _task_local_checkout_timeouts(task: TaskSpec | dict) -> dict[str, int]:
+    """Resolve stage-specific local-checkout timeout budgets with compatibility fallbacks."""
+
+    metadata = _task_value(task, "metadata", {})
+    local_checkout_metadata = {}
+    if isinstance(metadata, dict) and isinstance(metadata.get("local_checkout"), dict):
+        local_checkout_metadata.update(metadata["local_checkout"])
+        if isinstance(metadata["local_checkout"].get("timeouts"), dict):
+            local_checkout_metadata.update(metadata["local_checkout"]["timeouts"])
+    if isinstance(metadata, dict) and isinstance(metadata.get("local_checkout_timeouts"), dict):
+        local_checkout_metadata.update(metadata["local_checkout_timeouts"])
+    if isinstance(task, dict) and isinstance(task.get("local_checkout_timeouts"), dict):
+        local_checkout_metadata.update(task["local_checkout_timeouts"])
+
+    def _candidate_timeouts(stage: str) -> list[object]:
+        stage_names = {
+            "patch_apply": ("patch_apply_timeout_seconds", "patch_timeout_seconds", "patch_apply"),
+            "setup": ("setup_timeout_seconds", "setup"),
+            "install": ("install_timeout_seconds", "install"),
+            "verifier": ("verifier_timeout_seconds", "verifier"),
+        }[stage]
+        candidates: list[object] = []
+        for name in stage_names:
+            if name in local_checkout_metadata:
+                candidates.append(local_checkout_metadata[name])
+            if isinstance(metadata, dict) and name in metadata:
+                candidates.append(metadata[name])
+            if isinstance(task, dict) and name in task:
+                candidates.append(task[name])
+        return candidates
+
+    def resolve(stage: str, *, include_environment: bool = True, include_verifier: bool = False) -> int:
+        for candidate in _candidate_timeouts(stage):
+            timeout = _task_timeout_value({"timeout_seconds": candidate}, "timeout_seconds")
+            if timeout is not None:
+                return timeout
+
+        if include_verifier:
+            timeout = _task_timeout_value(_task_value(task, "verifier", None), "timeout_seconds")
+            if timeout is not None:
+                return timeout
+            timeout = _task_timeout_value(task, "verifier_timeout_seconds")
+            if timeout is not None:
+                return timeout
+        if include_environment:
+            timeout = _task_timeout_value(_task_value(task, "environment", None), "timeout_seconds")
+            if timeout is not None:
+                return timeout
+            timeout = _task_timeout_value(task, "environment_timeout_seconds")
+            if timeout is not None:
+                return timeout
+        return 180
+
+    return {
+        "patch_apply": resolve("patch_apply"),
+        "setup": resolve("setup"),
+        "install": resolve("install"),
+        "verifier": resolve("verifier", include_environment=True, include_verifier=True),
+    }
+
+
 def _task_snapshot_path(task: TaskSpec | dict) -> Path | None:
     """Return the repository snapshot path for a local-checkout task."""
 
@@ -231,6 +309,7 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "setup_commands": setup_commands,
             "install_commands": install_commands,
             "verifier_commands": commands,
+            "timeouts": _task_local_checkout_timeouts(task),
             "environment_timeout": task.environment.timeout_seconds,
             "verifier_timeout": task.verifier.timeout_seconds,
             "metadata": dict(task.metadata),
@@ -256,6 +335,7 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "setup_commands": setup_commands,
             "install_commands": install_commands,
             "verifier_commands": commands,
+            "timeouts": _task_local_checkout_timeouts(task),
             "environment_timeout": environment.get("timeout_seconds"),
             "verifier_timeout": verifier.get("timeout_seconds"),
             "metadata": dict(task.get("metadata", {})),
@@ -287,6 +367,7 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "setup_commands": setup_commands,
             "install_commands": install_commands,
             "verifier_commands": commands,
+            "timeouts": _task_local_checkout_timeouts(task),
             "environment_timeout": task.get("environment_timeout_seconds"),
             "verifier_timeout": task.get("verifier_timeout_seconds"),
             "metadata": dict(task.get("metadata", {})),
@@ -306,6 +387,7 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "setup_commands": setup_commands,
             "install_commands": install_commands,
             "verifier_commands": commands,
+            "timeouts": _task_local_checkout_timeouts(task),
             "environment_timeout": task.get("environment_timeout_seconds"),
             "verifier_timeout": task.get("verifier_timeout_seconds"),
             "metadata": dict(task.get("metadata", {})),
@@ -429,12 +511,119 @@ def _run_local_checkout_verifier(
     setup_commands: tuple[str, ...],
     install_commands: tuple[str, ...],
     verifier_commands: list[str],
-    timeout: int,
+    timeout: int | None = None,
+    patch_apply_timeout: int | None = None,
+    setup_timeout: int | None = None,
+    install_timeout: int | None = None,
+    verifier_timeout: int | None = None,
 ) -> tuple[bool, str]:
     """Verify a local-checkout task in a fresh copy of the snapshot."""
 
     if not verifier_commands:
         return False, "no_shell_command"
+
+    shared_timeout = timeout
+    stage_timeouts = (
+        patch_apply_timeout,
+        setup_timeout,
+        install_timeout,
+        verifier_timeout,
+    )
+    if shared_timeout is None and all(value is not None for value in stage_timeouts):
+        unique_timeouts = {int(value) for value in stage_timeouts if value is not None}
+        if len(unique_timeouts) == 1:
+            shared_timeout = unique_timeouts.pop()
+
+    if shared_timeout is not None and any(value is None for value in stage_timeouts):
+        patch_apply_timeout = shared_timeout
+        setup_timeout = shared_timeout
+        install_timeout = shared_timeout
+        verifier_timeout = shared_timeout
+
+    if shared_timeout is not None:
+        verify_dir = Path(tempfile.mkdtemp(prefix="gskill_verify_"))
+        try:
+            shutil.copytree(snapshot_path, verify_dir, dirs_exist_ok=True)
+        except Exception as exc:
+            _log(f"Could not copy snapshot for verification: {type(exc).__name__}: {exc}")
+            return False, "snapshot_copy_failed"
+
+        patch_file = None
+        stage_file = verify_dir / ".gskill_stage"
+        try:
+            if patch.strip():
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".patch", delete=False, prefix="gskill_patch_"
+                ) as f:
+                    f.write(patch)
+                    patch_file = Path(f.name)
+                apply_script = textwrap.dedent(
+                    f"""\
+                    git apply {shlex.quote(str(patch_file))} 2>/dev/null || patch -p1 < {shlex.quote(str(patch_file))} 2>/dev/null
+                    """
+                ).strip()
+                applied, _, apply_reason = _run_shell_script(
+                    apply_script,
+                    cwd=verify_dir,
+                    timeout=shared_timeout,
+                    label="patch_apply",
+                )
+                if not applied:
+                    return False, apply_reason
+
+            command_groups = (
+                ("setup", setup_commands),
+                ("install", install_commands),
+                ("verifier", tuple(verifier_commands)),
+            )
+            sequence_lines = ["set -euo pipefail"]
+            for stage_label, commands in command_groups:
+                if not commands:
+                    continue
+                sequence_lines.append(
+                    f"printf '%s' {shlex.quote(stage_label)} > {shlex.quote(str(stage_file))}"
+                )
+                sequence_lines.extend(commands)
+            sequence_script = "\n".join(sequence_lines)
+
+            try:
+                result = subprocess.run(
+                    ["bash", "-lc", sequence_script],
+                    cwd=str(verify_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=shared_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                stage_label = stage_file.read_text().strip() if stage_file.exists() else "verifier"
+                if stage_label == "verifier":
+                    return False, "shell_command_timeout"
+                return False, f"{stage_label}_timeout"
+            except FileNotFoundError:
+                return False, "shell_command_shell_not_found"
+
+            stdout_tail = result.stdout[-500:] if result.stdout else ""
+            if stdout_tail:
+                _log(f"local_checkout stdout tail: {stdout_tail}")
+            if result.returncode == 0:
+                return True, "shell_command_passed"
+
+            stage_label = stage_file.read_text().strip() if stage_file.exists() else "verifier"
+            stderr_tail = result.stderr[-500:] if result.stderr else ""
+            _log(
+                f"{stage_label} failed exit={result.returncode} cwd={verify_dir} "
+                f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
+            )
+            if stage_label == "verifier":
+                return False, "shell_command_failed"
+            return False, f"{stage_label}_failed"
+        finally:
+            if patch_file is not None:
+                try:
+                    os.unlink(patch_file)
+                except OSError:
+                    pass
+        return False, "shell_command_failed"
 
     verify_dir = Path(tempfile.mkdtemp(prefix="gskill_verify_"))
     try:
@@ -460,58 +649,97 @@ def _run_local_checkout_verifier(
             applied, _, apply_reason = _run_shell_script(
                 apply_script,
                 cwd=verify_dir,
-                timeout=timeout,
+                timeout=int(patch_apply_timeout or 180),
                 label="patch_apply",
             )
             if not applied:
                 return False, apply_reason
 
-        command_groups = (
-            ("setup", setup_commands),
-            ("install", install_commands),
-            ("verifier", tuple(verifier_commands)),
-        )
-        sequence_lines = ["set -euo pipefail"]
-        for stage_label, commands in command_groups:
+        state_dir = verify_dir / ".gskill_state"
+        state_dir.mkdir(exist_ok=True)
+        state_env = state_dir / "env.sh"
+        state_cwd = state_dir / "cwd"
+
+        def run_stage(
+            stage_label: str,
+            commands: tuple[str, ...],
+            timeout_seconds: int | None,
+            failure_reason: str,
+            timeout_reason: str,
+        ) -> tuple[bool, str]:
             if not commands:
-                continue
-            sequence_lines.append(
+                return True, ""
+
+            script_lines = ["set -euo pipefail"]
+            if state_env.exists():
+                script_lines.append(f". {shlex.quote(str(state_env))}")
+            if state_cwd.exists():
+                script_lines.append(f"cd \"$(cat {shlex.quote(str(state_cwd))})\"")
+            script_lines.append(
                 f"printf '%s' {shlex.quote(stage_label)} > {shlex.quote(str(stage_file))}"
             )
-            sequence_lines.extend(commands)
-        sequence_script = "\n".join(sequence_lines)
+            script_lines.extend(commands)
+            script_lines.append(f"pwd > {shlex.quote(str(state_cwd))}")
+            script_lines.append(f"export -p > {shlex.quote(str(state_env))}")
+            script = "\n".join(script_lines)
 
-        try:
-            result = subprocess.run(
-                ["bash", "-lc", sequence_script],
-                cwd=str(verify_dir),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+            try:
+                result = subprocess.run(
+                    ["bash", "-lc", script],
+                    cwd=str(verify_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=int(timeout_seconds or 180),
+                )
+            except subprocess.TimeoutExpired:
+                return False, timeout_reason
+            except FileNotFoundError:
+                return False, "shell_command_shell_not_found"
+
+            stdout_tail = result.stdout[-500:] if result.stdout else ""
+            if stdout_tail:
+                _log(f"local_checkout stdout tail: {stdout_tail}")
+            if result.returncode == 0:
+                return True, ""
+
+            stderr_tail = result.stderr[-500:] if result.stderr else ""
+            _log(
+                f"{stage_label} failed exit={result.returncode} cwd={verify_dir} "
+                f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
             )
-        except subprocess.TimeoutExpired:
-            stage_label = stage_file.read_text().strip() if stage_file.exists() else "verifier"
-            if stage_label == "verifier":
-                return False, "shell_command_timeout"
-            return False, f"{stage_label}_timeout"
-        except FileNotFoundError:
-            return False, "shell_command_shell_not_found"
+            return False, failure_reason
 
-        stdout_tail = result.stdout[-500:] if result.stdout else ""
-        if stdout_tail:
-            _log(f"local_checkout stdout tail: {stdout_tail}")
-        if result.returncode == 0:
-            return True, "shell_command_passed"
-
-        stage_label = stage_file.read_text().strip() if stage_file.exists() else "verifier"
-        stderr_tail = result.stderr[-500:] if result.stderr else ""
-        _log(
-            f"{stage_label} failed exit={result.returncode} cwd={verify_dir} "
-            f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
+        passed, reason = run_stage(
+            "setup",
+            setup_commands,
+            setup_timeout,
+            "setup_failed",
+            "setup_timeout",
         )
-        if stage_label == "verifier":
-            return False, "shell_command_failed"
-        return False, f"{stage_label}_failed"
+        if not passed:
+            return False, reason
+
+        passed, reason = run_stage(
+            "install",
+            install_commands,
+            install_timeout,
+            "install_failed",
+            "install_timeout",
+        )
+        if not passed:
+            return False, reason
+
+        passed, reason = run_stage(
+            "verifier",
+            tuple(verifier_commands),
+            verifier_timeout,
+            "shell_command_failed",
+            "shell_command_timeout",
+        )
+        if not passed:
+            return False, reason
+
+        return True, "shell_command_passed"
     finally:
         if patch_file is not None:
             try:
@@ -790,18 +1018,16 @@ def make_evaluator(
                 result = agent.run(_task_problem_statement(task))
                 patch = _task_submission_patch(working_copy, result)
                 if patch.strip():
-                    timeout = int(
-                        instance.get("verifier_timeout")
-                        or instance.get("environment_timeout")
-                        or 180
-                    )
                     passed, test_reason = _run_local_checkout_verifier(
                         snapshot_path,
                         patch,
                         instance["setup_commands"],
                         instance["install_commands"],
                         instance["verifier_commands"],
-                        timeout,
+                        patch_apply_timeout=instance["timeouts"]["patch_apply"],
+                        setup_timeout=instance["timeouts"]["setup"],
+                        install_timeout=instance["timeouts"]["install"],
+                        verifier_timeout=instance["timeouts"]["verifier"],
                     )
                     score = 1.0 if passed else 0.0
                     _log(
