@@ -81,6 +81,9 @@ uv run python main.py run \
 # Explicitly select task sources (repeat --task-source to combine more than one)
 uv run python main.py run https://github.com/pallets/jinja --task-source swe-smith
 
+# Use the repo-native Python mutation source
+uv run python main.py run https://github.com/pallets/jinja --task-source python-mutation
+
 # Save a holdout test-set summary after optimization
 uv run python main.py run https://github.com/pallets/jinja --run-test-eval --test-eval-limit 10
 

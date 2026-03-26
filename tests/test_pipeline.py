@@ -166,3 +166,121 @@ def test_run_uses_target_work_area_for_tasks_and_saved_suite(monkeypatch, tmp_pa
     assert recorded["report_repo"] == "acme/commerce-api"
     assert recorded["report"]["holdout"]["score"] == 1.0
     assert recorded["report"]["task_bundle"]["source_counts"] == {"swe-smith": 3}
+
+
+def test_run_passes_repo_url_and_preserves_python_mutation_provenance(monkeypatch, tmp_path):
+    seed_suite = SkillSuite(
+        source_repo="twilwa/api-design-skills-package-v2",
+        target_repo="acme/commerce-api",
+        primary=SkillArtifact(
+            name="commerce-api-workflow",
+            description="Workflow guidance for the commerce API repo.",
+            content="---\nname: commerce-api-workflow\ndescription: Workflow guidance for the commerce API repo.\n---\n\nSeed body",
+            role="primary",
+        ),
+        companions=[],
+    )
+    recorded: dict[str, object] = {}
+
+    def fake_generate_initial_skill_suite(repo_url, target_work_area_url=None, model=None, base_url=None):
+        return seed_suite
+
+    bundle = TaskBundle(
+        tasks=[
+            TaskSpec(
+                id="mutation-1",
+                family="mutation",
+                source="python-mutation",
+                repo_name="acme/commerce-api",
+                problem_statement="Flip the add implementation.",
+                environment=EnvironmentSpec(kind="local_checkout", ref="/tmp/mutation-1"),
+                verifier=VerifierSpec(kind="shell_command", commands=("uv run pytest",)),
+                metadata={
+                    "mutation_source": {
+                        "kind": "python",
+                        "validation_command": "uv run pytest",
+                    }
+                },
+            )
+        ],
+        train=[],
+        val=[],
+        test=[],
+        provenance={
+            "source_counts": {"python-mutation": 1},
+            "sources": ["python-mutation"],
+            "mutation_source": {
+                "kind": "python",
+                "repo_url": "https://github.com/acme/commerce-api",
+            },
+        },
+    )
+    bundle = TaskBundle(
+        tasks=bundle.tasks,
+        train=bundle.tasks,
+        val=[],
+        test=[],
+        provenance=bundle.provenance,
+    )
+
+    def fake_build_task_bundle(
+        repo_name,
+        source_names=None,
+        limit=300,
+        train=0.67,
+        val=0.17,
+        repo_url=None,
+        scratch_dir=None,
+    ):
+        recorded["task_repo"] = repo_name
+        recorded["task_sources"] = source_names
+        return bundle
+
+    def fake_make_evaluator(agent_model=None):
+        return "evaluator"
+
+    def fake_optimize_anything(*, seed_candidate, evaluator, dataset, valset, objective, config):
+        return SimpleNamespace(
+            best_candidate="---\nname: commerce-api-workflow\ndescription: Optimized workflow guidance.\n---\n\nOptimized body",
+            val_aggregate_scores=[0.75],
+            best_idx=0,
+        )
+
+    def fake_save_skill_suite(skill_suite, repo_name, output_dir):
+        return tmp_path / "skill-suite.json"
+
+    def fake_save_run_report(report, repo_name, output_dir):
+        recorded["report"] = report
+        return Path(tmp_path) / "run-report.json"
+
+    monkeypatch.setattr(pipeline, "generate_initial_skill_suite", fake_generate_initial_skill_suite)
+    monkeypatch.setattr(pipeline, "build_task_bundle", fake_build_task_bundle)
+    monkeypatch.setattr(pipeline, "make_evaluator", fake_make_evaluator)
+    monkeypatch.setattr(pipeline, "optimize_anything", fake_optimize_anything)
+    monkeypatch.setattr(pipeline, "save_skill_suite", fake_save_skill_suite)
+    monkeypatch.setattr(pipeline, "save_run_report", fake_save_run_report)
+
+    pipeline.run(
+        repo_url="https://github.com/twilwa/api-design-skills-package-v2",
+        target_work_area="https://github.com/acme/commerce-api",
+        output_dir=str(tmp_path),
+        max_evals=5,
+        task_sources=["python-mutation"],
+        augment_suite=False,
+        run_test_eval=False,
+    )
+
+    assert recorded["task_repo"] == "acme/commerce-api"
+    assert recorded["task_sources"] == ["python-mutation"]
+    assert recorded["report"]["task_bundle"]["request"] == {
+        "repo_name": "acme/commerce-api",
+        "repo_url": "https://github.com/acme/commerce-api",
+        "limit": 300,
+        "scratch_dir": "scratchpad/task-bundles/acme__commerce-api",
+    }
+    assert recorded["report"]["task_bundle"]["source_counts"] == {"python-mutation": 1}
+    assert recorded["report"]["task_bundle"]["sources"] == ["python-mutation"]
+    assert recorded["report"]["task_bundle"]["mutation_source"] == {
+        "kind": "python",
+        "repo_url": "https://github.com/acme/commerce-api",
+    }
