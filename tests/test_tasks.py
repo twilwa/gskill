@@ -2,11 +2,75 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from src import tasks
+
+
+def _run_git(args: list[str], cwd: Path) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def _create_python_history_repo(root: Path) -> tuple[Path, str, str]:
+    repo_path = root / "history-replay-repo"
+    repo_path.mkdir()
+    _run_git(["init", "-b", "main"], cwd=repo_path)
+    _run_git(["config", "user.name", "Test User"], cwd=repo_path)
+    _run_git(["config", "user.email", "test@example.com"], cwd=repo_path)
+
+    (repo_path / "src").mkdir()
+    (repo_path / "tests").mkdir()
+    (repo_path / "src" / "__init__.py").write_text("")
+    (repo_path / "src" / "calculator.py").write_text(
+        "def add(left: int, right: int) -> int:\n"
+        "    return left - right\n"
+    )
+    (repo_path / "tests" / "test_calculator.py").write_text(
+        "from src.calculator import add\n\n"
+        "def test_add():\n"
+        "    assert add(2, 3) == 5\n"
+    )
+
+    _run_git(
+        ["add", "src/__init__.py", "src/calculator.py", "tests/test_calculator.py"],
+        cwd=repo_path,
+    )
+    _run_git(["commit", "-m", "feat: add calculator"], cwd=repo_path)
+
+    (repo_path / "src" / "calculator.py").write_text(
+        "def add(left: int, right: int) -> int:\n"
+        "    return left + right\n"
+    )
+    _run_git(["add", "src/calculator.py"], cwd=repo_path)
+    _run_git(["commit", "-m", "fix: correct calculator addition"], cwd=repo_path)
+
+    fixed_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ).stdout.strip()
+    parent_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD^"],
+        cwd=repo_path,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ).stdout.strip()
+    return repo_path, fixed_commit, parent_commit
 
 
 def test_swe_smith_source_collects_canonical_tasks(monkeypatch):
@@ -132,6 +196,36 @@ def test_build_task_bundle_passes_repo_context_to_python_mutation_source(monkeyp
     assert bundle.provenance["sources"] == ["python-mutation"]
     assert bundle.tasks[0].environment.kind == "local_checkout"
     assert Path(bundle.tasks[0].environment.ref).name == "mutation-1"
+
+
+def test_build_task_bundle_records_python_history_replay_commit_provenance(tmp_path):
+    repo_path, fixed_commit, parent_commit = _create_python_history_repo(tmp_path)
+
+    bundle = tasks.build_task_bundle(
+        repo_name="acme/calculator",
+        checkout_path=str(repo_path),
+        source_names=["python-history-replay"],
+        limit=1,
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    assert len(bundle.tasks) == 1
+    task = bundle.tasks[0]
+    assert task.source == "python-history-replay"
+    assert task.environment.kind == "local_checkout"
+    assert task.verifier.kind == "shell_command"
+    assert task.metadata["history_replay"] == {
+        "fixed_commit": fixed_commit,
+        "parent_commit": parent_commit,
+        "subject": "fix: correct calculator addition",
+        "changed_paths": ["src/calculator.py"],
+    }
+    assert bundle.provenance["source_counts"] == {"python-history-replay": 1}
+    assert bundle.provenance["sources"] == ["python-history-replay"]
+    assert bundle.provenance["history_replay_source"] == {
+        "kind": "python",
+        "checkout_path": str(repo_path),
+    }
 
 
 def test_build_task_bundle_rejects_unknown_sources():

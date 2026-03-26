@@ -200,7 +200,7 @@ def _materialize_repo_checkout(
         return repo_root
 
     raise ValueError(
-        f"Task source '{PYTHON_MUTATION_TASK_SOURCE}' requires a repo URL or checkout path for {request.repo_name}."
+        f"Repo-native task generation requires a repo URL or checkout path for {request.repo_name}."
     )
 
 
@@ -378,6 +378,17 @@ def _copy_checkout(repo_root: Path, destination: Path) -> Path:
     return destination
 
 
+def _clear_python_runtime_artifacts(repo_root: Path) -> None:
+    """Remove cached Python runtime artifacts from a checkout snapshot."""
+
+    for cache_dir in repo_root.rglob("__pycache__"):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    for cache_dir in repo_root.rglob(".pytest_cache"):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    for compiled_file in repo_root.rglob("*.pyc"):
+        compiled_file.unlink(missing_ok=True)
+
+
 def _mutation_task_id(request: TaskSourceRequest, candidate: PythonMutationCandidate) -> str:
     """Create a stable task id for a mutation candidate."""
 
@@ -482,9 +493,23 @@ def _checkout_commit_snapshot(repo_root: Path, commit: str, destination: Path) -
 
 
 def _reverse_commit_patch(snapshot_root: Path, patch_text: str) -> bool:
-    """Reverse-apply a commit patch into an exported snapshot."""
+    """Reverse-apply a commit patch into a git-backed snapshot."""
 
-    result = subprocess.run(
+    git_apply = subprocess.run(
+        ["git", "apply", "-R", "-"],
+        cwd=str(snapshot_root),
+        input=patch_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=DEFAULT_COMMAND_TIMEOUT,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if git_apply.returncode == 0:
+        return True
+
+    patch_apply = subprocess.run(
         ["patch", "-R", "-p1"],
         cwd=str(snapshot_root),
         input=patch_text,
@@ -495,7 +520,7 @@ def _reverse_commit_patch(snapshot_root: Path, patch_text: str) -> bool:
         encoding="utf-8",
         errors="replace",
     )
-    return result.returncode == 0
+    return patch_apply.returncode == 0
 
 
 class SweSmithSource:
@@ -557,6 +582,7 @@ class PythonMutationSource:
                 break
             checkout_copy = _copy_checkout(repo_root, snapshot_root / f"candidate-{index}")
             _apply_python_mutation(checkout_copy, candidate)
+            _clear_python_runtime_artifacts(checkout_copy)
             result = _run_shell_command(verifier_command, cwd=checkout_copy)
             if result.returncode == 0:
                 shutil.rmtree(checkout_copy)
@@ -636,6 +662,7 @@ class PythonHistoryReplaySource:
                 candidate.commit,
                 snapshot_root / f"candidate-{index}-{candidate.commit[:8]}",
             )
+            _clear_python_runtime_artifacts(snapshot_path)
             baseline = _run_shell_command(verifier_command, cwd=snapshot_path)
             if baseline.returncode != 0:
                 shutil.rmtree(snapshot_path, ignore_errors=True)
@@ -653,6 +680,7 @@ class PythonHistoryReplaySource:
                 shutil.rmtree(snapshot_path, ignore_errors=True)
                 continue
 
+            _clear_python_runtime_artifacts(snapshot_path)
             broken = _run_shell_command(verifier_command, cwd=snapshot_path)
             if broken.returncode == 0:
                 shutil.rmtree(snapshot_path, ignore_errors=True)

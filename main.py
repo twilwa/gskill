@@ -76,7 +76,7 @@ def run(
         help=(
             "Named task source to use when building the optimization bundle. "
             "Repeat the flag to combine multiple sources. Defaults to the registered SWE-smith source. "
-            "Registered sources include swe-smith and python-mutation."
+            "Registered sources include swe-smith, python-mutation, and python-history-replay."
         ),
     ),
     augment_suite: bool = typer.Option(

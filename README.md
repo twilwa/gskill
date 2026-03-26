@@ -84,6 +84,9 @@ uv run python main.py run https://github.com/pallets/jinja --task-source swe-smi
 # Use the repo-native Python mutation source
 uv run python main.py run https://github.com/pallets/jinja --task-source python-mutation
 
+# Use the repo-native Python history replay source
+uv run python main.py run https://github.com/pallets/jinja --task-source python-history-replay
+
 # Save a holdout test-set summary after optimization
 uv run python main.py run https://github.com/pallets/jinja --run-test-eval --test-eval-limit 10
 
@@ -106,6 +109,8 @@ uv run python main.py tasks pallets/jinja
 # Show more
 uv run python main.py tasks pallets/jinja --limit 25
 ```
+
+Task sources are selected with `--task-source`. Registered sources include `swe-smith`, `python-mutation`, and `python-history-replay`. If you do not pass the flag, `gskill` keeps using the default `swe-smith` source.
 
 ### Help
 
