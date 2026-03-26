@@ -200,6 +200,256 @@ index 0000000..1111111 100644
     assert (checkout / "src" / "math_utils.py").read_text() == "def add(a, b):\n    return a + b\n"
 
 
+def test_evaluator_uses_stage_specific_local_checkout_timeout_budgets(monkeypatch, tmp_path):
+    checkout = tmp_path / "checkout"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "tests").mkdir()
+    (checkout / "src" / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n"
+    )
+    (checkout / "tests" / "test_math_utils.py").write_text(
+        "from src.math_utils import add\n\n\n"
+        "def test_add():\n"
+        "    assert add(1, 2) == 3\n"
+    )
+
+    setup_command = (
+        "python -c \"from pathlib import Path; Path('setup.marker').write_text('setup')\""
+    )
+    install_command = (
+        "python -c \"from pathlib import Path; "
+        "assert Path('setup.marker').read_text() == 'setup'; "
+        "Path('install.marker').write_text('install')\""
+    )
+    verifier_command = (
+        "python -c \"from pathlib import Path; "
+        "assert Path('setup.marker').read_text() == 'setup'; "
+        "assert Path('install.marker').read_text() == 'install'; "
+        "assert Path('src/math_utils.py').read_text() == 'def add(a, b):\\n    return a - b\\n'\""
+    )
+    patch = """diff --git a/src/math_utils.py b/src/math_utils.py
+index 0000000..1111111 100644
+--- a/src/math_utils.py
++++ b/src/math_utils.py
+@@
+-def add(a, b):
+-    return a + b
++def add(a, b):
++    return a - b
+"""
+    stage_calls = []
+
+    class FakeAgent:
+        def run(self, prompt: str):
+            return {"submission": patch}
+
+    def fake_get_model(config=None):
+        return object()
+
+    def fake_get_agent(model, env, config, default_type="default"):
+        return FakeAgent()
+
+    def fake_run(cmd, *args, **kwargs):
+        command = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        cwd = Path(kwargs.get("cwd") or checkout)
+        timeout = kwargs.get("timeout")
+
+        if "git apply" in command or "patch -p1" in command:
+            stage_calls.append(("patch_apply", timeout))
+            (cwd / "src" / "math_utils.py").write_text(
+                "def add(a, b):\n    return a - b\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="applied", stderr="")
+
+        if setup_command in command:
+            stage_calls.append(("setup", timeout))
+            (cwd / "setup.marker").write_text("setup")
+            return subprocess.CompletedProcess(cmd, 0, stdout="setup", stderr="")
+
+        if install_command in command:
+            stage_calls.append(("install", timeout))
+            assert (cwd / "setup.marker").read_text() == "setup"
+            (cwd / "install.marker").write_text("install")
+            return subprocess.CompletedProcess(cmd, 0, stdout="install", stderr="")
+
+        if verifier_command in command:
+            stage_calls.append(("verifier", timeout))
+            assert (cwd / "setup.marker").read_text() == "setup"
+            assert (cwd / "install.marker").read_text() == "install"
+            assert (cwd / "src" / "math_utils.py").read_text() == (
+                "def add(a, b):\n    return a - b\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="passed", stderr="")
+
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("src.evaluator.get_model", fake_get_model)
+    monkeypatch.setattr("src.evaluator.get_agent", fake_get_agent)
+    monkeypatch.setattr("src.evaluator.subprocess.run", fake_run)
+
+    evaluator = make_evaluator(agent_model="openai/test-model")
+    task = TaskSpec(
+        id="local-specific-timeouts",
+        family="mutation",
+        source="python-mutation",
+        repo_name="acme/commerce-api",
+        problem_statement="Flip the add implementation.",
+        environment=EnvironmentSpec(
+            kind="local_checkout",
+            ref=str(checkout),
+            setup_commands=(setup_command,),
+            install_commands=(install_command,),
+        ),
+        verifier=VerifierSpec(
+            kind="shell_command",
+            commands=(verifier_command,),
+        ),
+        metadata={
+            "snapshot_path": str(checkout),
+            "local_checkout_timeouts": {
+                "patch_apply_timeout_seconds": 5,
+                "setup_timeout_seconds": 7,
+                "install_timeout_seconds": 11,
+                "verifier_timeout_seconds": 13,
+            },
+        },
+    )
+
+    score, info = evaluator("candidate skill", task)
+
+    assert score == 1.0
+    assert info["instance_id"] == "local-specific-timeouts"
+    assert info["test_failure_reason"] == "shell_command_passed"
+    assert stage_calls == [
+        ("patch_apply", 5),
+        ("setup", 7),
+        ("install", 11),
+        ("verifier", 13),
+    ]
+
+
+def test_evaluator_falls_back_to_legacy_local_checkout_timeouts(monkeypatch, tmp_path):
+    checkout = tmp_path / "checkout"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "tests").mkdir()
+    (checkout / "src" / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n"
+    )
+    (checkout / "tests" / "test_math_utils.py").write_text(
+        "from src.math_utils import add\n\n\n"
+        "def test_add():\n"
+        "    assert add(1, 2) == 3\n"
+    )
+
+    setup_command = (
+        "python -c \"from pathlib import Path; Path('setup.marker').write_text('setup')\""
+    )
+    install_command = (
+        "python -c \"from pathlib import Path; "
+        "assert Path('setup.marker').read_text() == 'setup'; "
+        "Path('install.marker').write_text('install')\""
+    )
+    verifier_command = (
+        "python -c \"from pathlib import Path; "
+        "assert Path('setup.marker').read_text() == 'setup'; "
+        "assert Path('install.marker').read_text() == 'install'; "
+        "assert Path('src/math_utils.py').read_text() == 'def add(a, b):\\n    return a - b\\n'\""
+    )
+    patch = """diff --git a/src/math_utils.py b/src/math_utils.py
+index 0000000..1111111 100644
+--- a/src/math_utils.py
++++ b/src/math_utils.py
+@@
+-def add(a, b):
+-    return a + b
++def add(a, b):
++    return a - b
+"""
+    stage_calls = []
+
+    class FakeAgent:
+        def run(self, prompt: str):
+            return {"submission": patch}
+
+    def fake_get_model(config=None):
+        return object()
+
+    def fake_get_agent(model, env, config, default_type="default"):
+        return FakeAgent()
+
+    def fake_run(cmd, *args, **kwargs):
+        command = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        cwd = Path(kwargs.get("cwd") or checkout)
+        timeout = kwargs.get("timeout")
+
+        if "git apply" in command or "patch -p1" in command:
+            stage_calls.append(("patch_apply", timeout))
+            (cwd / "src" / "math_utils.py").write_text(
+                "def add(a, b):\n    return a - b\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="applied", stderr="")
+
+        if setup_command in command:
+            stage_calls.append(("setup", timeout))
+            (cwd / "setup.marker").write_text("setup")
+            return subprocess.CompletedProcess(cmd, 0, stdout="setup", stderr="")
+
+        if install_command in command:
+            stage_calls.append(("install", timeout))
+            assert (cwd / "setup.marker").read_text() == "setup"
+            (cwd / "install.marker").write_text("install")
+            return subprocess.CompletedProcess(cmd, 0, stdout="install", stderr="")
+
+        if verifier_command in command:
+            stage_calls.append(("verifier", timeout))
+            assert (cwd / "setup.marker").read_text() == "setup"
+            assert (cwd / "install.marker").read_text() == "install"
+            assert (cwd / "src" / "math_utils.py").read_text() == (
+                "def add(a, b):\n    return a - b\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="passed", stderr="")
+
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("src.evaluator.get_model", fake_get_model)
+    monkeypatch.setattr("src.evaluator.get_agent", fake_get_agent)
+    monkeypatch.setattr("src.evaluator.subprocess.run", fake_run)
+
+    evaluator = make_evaluator(agent_model="openai/test-model")
+    task = TaskSpec(
+        id="local-legacy-timeouts",
+        family="mutation",
+        source="python-mutation",
+        repo_name="acme/commerce-api",
+        problem_statement="Flip the add implementation.",
+        environment=EnvironmentSpec(
+            kind="local_checkout",
+            ref=str(checkout),
+            setup_commands=(setup_command,),
+            install_commands=(install_command,),
+            timeout_seconds=30,
+        ),
+        verifier=VerifierSpec(
+            kind="shell_command",
+            commands=(verifier_command,),
+            timeout_seconds=40,
+        ),
+        metadata={"snapshot_path": str(checkout)},
+    )
+
+    score, info = evaluator("candidate skill", task)
+
+    assert score == 1.0
+    assert info["instance_id"] == "local-legacy-timeouts"
+    assert info["test_failure_reason"] == "shell_command_passed"
+    assert stage_calls == [
+        ("patch_apply", 30),
+        ("setup", 30),
+        ("install", 30),
+        ("verifier", 40),
+    ]
+
+
 @pytest.mark.parametrize(
     ("failed_stage", "stage_command"),
     [
@@ -376,6 +626,69 @@ def test_local_checkout_verifier_preserves_shell_state_across_bootstrap_stages(t
     assert passed is True
     assert reason == "shell_command_passed"
     assert (snapshot / "src" / "math_utils.py").read_text() == "def add(a, b):\n    return a + b\n"
+
+
+def test_task_to_local_checkout_collects_stage_specific_timeouts():
+    task = TaskSpec(
+        id="local-timeouts",
+        family="mutation",
+        source="python-mutation",
+        repo_name="acme/commerce-api",
+        problem_statement="Run staged verifier commands.",
+        environment=EnvironmentSpec(
+            kind="local_checkout",
+            ref="HEAD",
+            timeout_seconds=30,
+        ),
+        verifier=VerifierSpec(
+            kind="shell_command",
+            commands=("echo verify",),
+            timeout_seconds=40,
+        ),
+        metadata={
+            "snapshot_path": str(Path.cwd()),
+            "local_checkout_timeouts": {
+                "patch_apply_timeout_seconds": 5,
+                "setup_timeout_seconds": 7,
+                "install_timeout_seconds": 11,
+                "verifier_timeout_seconds": 13,
+            },
+        },
+    )
+
+    instance = _task_to_local_checkout(task)
+
+    assert instance is not None
+    assert instance["timeouts"] == {
+        "patch_apply": 5,
+        "setup": 7,
+        "install": 11,
+        "verifier": 13,
+    }
+
+
+def test_task_to_local_checkout_falls_back_to_legacy_timeouts_for_compat_dict(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+
+    instance = _task_to_local_checkout(
+        {
+            "instance_id": "compat-timeouts",
+            "problem_statement": "Run verifier with legacy timeout fields.",
+            "snapshot_path": str(snapshot),
+            "environment_timeout_seconds": 30,
+            "verifier_timeout_seconds": 40,
+            "commands": ["echo verify"],
+        }
+    )
+
+    assert instance is not None
+    assert instance["timeouts"] == {
+        "patch_apply": 30,
+        "setup": 30,
+        "install": 30,
+        "verifier": 40,
+    }
 
 
 def test_task_to_local_checkout_keeps_bootstrap_commands_for_compat_dict(tmp_path):

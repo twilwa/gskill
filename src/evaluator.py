@@ -623,6 +623,8 @@ def _run_local_checkout_verifier(
                     os.unlink(patch_file)
                 except OSError:
                     pass
+            stage_file.unlink(missing_ok=True)
+            shutil.rmtree(verify_dir, ignore_errors=True)
         return False, "shell_command_failed"
 
     verify_dir = Path(tempfile.mkdtemp(prefix="gskill_verify_"))
