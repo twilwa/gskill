@@ -1,3 +1,5 @@
+# ABOUTME: Evaluates candidate skills against benchmark tasks.
+# ABOUTME: Runs local-checkout and SWE-bench verification paths.
 """Mini-SWE-Agent evaluator for GEPA multi-task search."""
 
 import os
@@ -79,18 +81,41 @@ def _task_kind(spec: object) -> str:
     return str(getattr(spec, "kind", ""))
 
 
-def _task_commands(spec: object) -> tuple[str, ...]:
+def _task_commands(spec: object, field_name: str = "commands") -> tuple[str, ...]:
     """Read a nested command list from dataclass or dict metadata."""
 
     if spec is None:
         return ()
     if isinstance(spec, dict):
-        commands = spec.get("commands", ())
+        commands = spec.get(field_name, ())
     else:
-        commands = getattr(spec, "commands", ())
+        commands = getattr(spec, field_name, ())
     if isinstance(commands, str):
         return (commands,)
     return tuple(str(command) for command in commands if str(command).strip())
+
+
+def _task_environment_commands(task: TaskSpec | dict, field_name: str) -> tuple[str, ...]:
+    """Read local-checkout bootstrap commands from the task environment."""
+
+    environment = _task_value(task, "environment", None)
+    commands = _task_commands(environment, field_name)
+    if commands:
+        return commands
+
+    if isinstance(task, dict):
+        commands = _task_commands(task, field_name)
+        if commands:
+            return commands
+
+    metadata = _task_value(task, "metadata", {})
+    if isinstance(metadata, dict):
+        value = metadata.get(field_name, ())
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, (list, tuple)):
+            return tuple(str(command) for command in value if str(command).strip())
+    return ()
 
 
 def _task_snapshot_path(task: TaskSpec | dict) -> Path | None:
@@ -194,6 +219,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
         snapshot_path = _task_snapshot_path(task)
         if snapshot_path is None:
             return None
+        setup_commands = _task_environment_commands(task, "setup_commands")
+        install_commands = _task_environment_commands(task, "install_commands")
         commands = _task_shell_verifier(task)
         if not commands:
             return None
@@ -201,6 +228,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "instance_id": task.id,
             "problem_statement": task.problem_statement,
             "snapshot_path": snapshot_path,
+            "setup_commands": setup_commands,
+            "install_commands": install_commands,
             "verifier_commands": commands,
             "environment_timeout": task.environment.timeout_seconds,
             "verifier_timeout": task.verifier.timeout_seconds,
@@ -215,6 +244,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
         if _task_kind(verifier) != _LOCAL_CHECKOUT_VERIFIER_KIND:
             return None
         snapshot_path = _task_snapshot_path(task)
+        setup_commands = _task_environment_commands(task, "setup_commands")
+        install_commands = _task_environment_commands(task, "install_commands")
         commands = _task_shell_verifier(task)
         if snapshot_path is None or not commands:
             return None
@@ -222,6 +253,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "instance_id": str(task.get("instance_id", "unknown")),
             "problem_statement": str(task.get("problem_statement", "")),
             "snapshot_path": snapshot_path,
+            "setup_commands": setup_commands,
+            "install_commands": install_commands,
             "verifier_commands": commands,
             "environment_timeout": environment.get("timeout_seconds"),
             "verifier_timeout": verifier.get("timeout_seconds"),
@@ -242,6 +275,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
         )
     ):
         snapshot_path = _task_snapshot_path(task)
+        setup_commands = _task_environment_commands(task, "setup_commands")
+        install_commands = _task_environment_commands(task, "install_commands")
         commands = _task_shell_verifier(task)
         if snapshot_path is None or not commands:
             return None
@@ -249,6 +284,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "instance_id": str(task.get("instance_id", "unknown")),
             "problem_statement": str(task.get("problem_statement", "")),
             "snapshot_path": snapshot_path,
+            "setup_commands": setup_commands,
+            "install_commands": install_commands,
             "verifier_commands": commands,
             "environment_timeout": task.get("environment_timeout_seconds"),
             "verifier_timeout": task.get("verifier_timeout_seconds"),
@@ -257,6 +294,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
 
     if _task_kind(environment) == _LOCAL_CHECKOUT_ENV_KIND:
         snapshot_path = _task_snapshot_path(task)
+        setup_commands = _task_environment_commands(task, "setup_commands")
+        install_commands = _task_environment_commands(task, "install_commands")
         commands = _task_shell_verifier(task)
         if snapshot_path is None or not commands:
             return None
@@ -264,6 +303,8 @@ def _task_local_checkout_instance(task: TaskSpec | dict) -> dict | None:
             "instance_id": str(task.get("instance_id", "unknown")),
             "problem_statement": str(task.get("problem_statement", "")),
             "snapshot_path": snapshot_path,
+            "setup_commands": setup_commands,
+            "install_commands": install_commands,
             "verifier_commands": commands,
             "environment_timeout": task.get("environment_timeout_seconds"),
             "verifier_timeout": task.get("verifier_timeout_seconds"),
@@ -385,6 +426,8 @@ def _task_submission_patch(task_dir: Path | None, result: object) -> str:
 def _run_local_checkout_verifier(
     snapshot_path: Path,
     patch: str,
+    setup_commands: tuple[str, ...],
+    install_commands: tuple[str, ...],
     verifier_commands: list[str],
     timeout: int,
 ) -> tuple[bool, str]:
@@ -401,6 +444,7 @@ def _run_local_checkout_verifier(
         return False, "snapshot_copy_failed"
 
     patch_file = None
+    stage_file = verify_dir / ".gskill_stage"
     try:
         if patch.strip():
             with tempfile.NamedTemporaryFile(
@@ -422,23 +466,59 @@ def _run_local_checkout_verifier(
             if not applied:
                 return False, apply_reason
 
-        verifier_script = "set -euo pipefail\n" + "\n".join(verifier_commands)
-        passed, result, reason = _run_shell_script(
-            verifier_script,
-            cwd=verify_dir,
-            timeout=timeout,
-            label="shell_command",
+        command_groups = (
+            ("setup", setup_commands),
+            ("install", install_commands),
+            ("verifier", tuple(verifier_commands)),
         )
-        if result is not None:
-            stdout_tail = result.stdout[-500:] if result.stdout else ""
-            _log(f"Verifier stdout tail: {stdout_tail}")
-        return passed, reason
+        sequence_lines = ["set -euo pipefail"]
+        for stage_label, commands in command_groups:
+            if not commands:
+                continue
+            sequence_lines.append(
+                f"printf '%s' {shlex.quote(stage_label)} > {shlex.quote(str(stage_file))}"
+            )
+            sequence_lines.extend(commands)
+        sequence_script = "\n".join(sequence_lines)
+
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", sequence_script],
+                cwd=str(verify_dir),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            stage_label = stage_file.read_text().strip() if stage_file.exists() else "verifier"
+            if stage_label == "verifier":
+                return False, "shell_command_timeout"
+            return False, f"{stage_label}_timeout"
+        except FileNotFoundError:
+            return False, "shell_command_shell_not_found"
+
+        stdout_tail = result.stdout[-500:] if result.stdout else ""
+        if stdout_tail:
+            _log(f"local_checkout stdout tail: {stdout_tail}")
+        if result.returncode == 0:
+            return True, "shell_command_passed"
+
+        stage_label = stage_file.read_text().strip() if stage_file.exists() else "verifier"
+        stderr_tail = result.stderr[-500:] if result.stderr else ""
+        _log(
+            f"{stage_label} failed exit={result.returncode} cwd={verify_dir} "
+            f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
+        )
+        if stage_label == "verifier":
+            return False, "shell_command_failed"
+        return False, f"{stage_label}_failed"
     finally:
         if patch_file is not None:
             try:
                 os.unlink(patch_file)
             except OSError:
                 pass
+        stage_file.unlink(missing_ok=True)
         shutil.rmtree(verify_dir, ignore_errors=True)
 
 
@@ -718,6 +798,8 @@ def make_evaluator(
                     passed, test_reason = _run_local_checkout_verifier(
                         snapshot_path,
                         patch,
+                        instance["setup_commands"],
+                        instance["install_commands"],
                         instance["verifier_commands"],
                         timeout,
                     )
