@@ -1,14 +1,31 @@
+# ABOUTME: Defines the gskill CLI entry point.
+# ABOUTME: Exposes commands for running the pipeline and previewing tasks.
 """gskill CLI entry point."""
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
+from datetime import datetime
+
 import typer
+
+from src import tasks as task_bundle
 
 app = typer.Typer(
     name="gskill",
     help="Automatically learn repository-specific skills for coding agents.",
     add_completion=False,
 )
+
+
+def _extract_repo_name(repo: str) -> str:
+    """Extract an owner/repo slug from a repo identifier or GitHub URL."""
+    value = repo.rstrip("/")
+    if "github.com/" in value:
+        parts = value.split("github.com/")[-1].split("/")
+        return f"{parts[0]}/{parts[1]}"
+    return value
 
 
 @app.command()
@@ -123,42 +140,65 @@ def run(
 def tasks(
     repo: str = typer.Argument(
         ...,
-        help="Repository name in 'owner/repo' format, e.g. pallets/jinja",
+        help="Repository name or GitHub URL, e.g. pallets/jinja or https://github.com/pallets/jinja",
     ),
     limit: int = typer.Option(
         10,
         "--limit",
         "-l",
-        help="Number of tasks to show.",
+        help="Maximum number of tasks to collect from each selected source.",
     ),
     list_all: bool = typer.Option(
         False,
         "--list",
-        help="List all available tasks (up to --limit).",
+        help="Print a concise summary of the selected tasks to stdout.",
+    ),
+    task_sources: list[str] | None = typer.Option(
+        None,
+        "--task-source",
+        help=(
+            "Named task source to use when building the preview bundle. "
+            "Repeat the flag to combine multiple sources. Defaults to the registered SWE-smith source. "
+            "Registered sources include swe-smith, python-mutation, and python-history-replay."
+        ),
+    ),
+    checkout_path: str = typer.Option(
+        "",
+        "--checkout-path",
+        help="Path to a local checkout for repo-native task sources.",
     ),
 ) -> None:
-    """List available SWE-smith tasks for a repository and write them to a JSON file."""
-    import json
-    from datetime import datetime
-
-    from src.tasks import load_tasks
+    """Preview canonical tasks for a repository and write them to a JSON file."""
 
     try:
-        all_tasks = load_tasks(repo, n=300)
+        repo_name = _extract_repo_name(repo)
+        repo_url = repo if "github.com" in repo else None
+        bundle = task_bundle.build_task_bundle(
+            repo_name=repo_name,
+            repo_url=repo_url,
+            checkout_path=checkout_path or None,
+            source_names=task_sources or None,
+            limit=limit,
+        )
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
 
-    shown = all_tasks[:limit]
-
-    owner, repo_name = repo.split("/", 1)
+    owner, short_repo_name = repo_name.split("/", 1)
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    filename = f"{repo_name}-{owner}--tasks-{timestamp}.json"
+    filename = f"{short_repo_name}-{owner}--tasks-{timestamp}.json"
 
     with open(filename, "w") as f:
-        json.dump(shown, f, indent=2, default=str)
+        json.dump(asdict(bundle), f, indent=2, default=str)
 
-    typer.echo(f"Found {len(all_tasks)} tasks for '{repo}' ({len(shown)} written to {filename})")
+    if list_all:
+        for task in bundle.tasks:
+            typer.echo(f"{task.id} [{task.source}:{task.family}] {task.problem_statement}")
+
+    typer.echo(
+        f"Found {len(bundle.tasks)} canonical tasks for '{repo}' "
+        f"({len(bundle.tasks)} written to {filename})"
+    )
 
 
 def main() -> None:
