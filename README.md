@@ -103,14 +103,25 @@ You can also set the agent model via the `GSKILL_AGENT_MODEL` environment variab
 ### Preview available tasks
 
 ```bash
-# Show the first 10 SWE-smith tasks for a repo
+# Show the first canonical SWE-smith preview bundle for a repo
 uv run python main.py tasks pallets/jinja
 
-# Show more
-uv run python main.py tasks pallets/jinja --limit 25
+# Print concise task summaries while still writing the JSON bundle
+uv run python main.py tasks pallets/jinja --limit 25 --list
+
+# Preview a repo-native history replay bundle from a local checkout
+uv run python main.py tasks \
+  pallets/jinja \
+  --task-source python-history-replay \
+  --checkout-path ~/src/jinja
+
+# Preview a repo-native mutation bundle directly from a GitHub URL
+uv run python main.py tasks \
+  https://github.com/pallets/jinja \
+  --task-source python-mutation
 ```
 
-Task sources are selected with `--task-source`. Registered sources include `swe-smith`, `python-mutation`, and `python-history-replay`. If you do not pass the flag, `gskill` keeps using the default `swe-smith` source.
+`gskill tasks` now writes a canonical task-bundle JSON artifact, so the preview output matches the bundle shape used by `gskill run`. Task sources are selected with `--task-source`, `--limit` applies per selected source, and repo-native previews can use `--checkout-path` or a GitHub URL positional argument. Registered sources include `swe-smith`, `python-mutation`, and `python-history-replay`. If you do not pass `--task-source`, `gskill` keeps using the default `swe-smith` source.
 
 ### Help
 
