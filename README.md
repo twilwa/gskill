@@ -21,7 +21,7 @@ It implements the pipeline described in the [GEPA blog post](https://gepa-ai.git
 
 1. Reads a source corpus repository and generates an initial workflow skill from its README plus high-signal repo files
 2. Optionally treats a different repository as the target work area via `--target-work-area`
-3. Loads verifiable software engineering tasks from [SWE-smith](https://huggingface.co/datasets/SWE-bench/SWE-smith) for the target work area
+3. Builds a canonical task bundle from one or more task sources for the target work area
 4. Uses [GEPA](https://github.com/gepa-ai/gepa)'s `optimize_anything` to iteratively refine the primary workflow skill through evolutionary search
 5. Runs an augmentation pass to generate companion skills grounded in the source corpus
 6. Can evaluate the best candidate on a holdout test split
@@ -52,7 +52,7 @@ uv run python main.py run https://github.com/pallets/jinja
 ```
 
 This will:
-- Load SWE-smith tasks for `pallets/jinja`
+- Load the default SWE-smith task source for `pallets/jinja`
 - Generate an initial workflow skill
 - Run up to 150 mini evaluations to optimize the workflow skill
 - Write the primary skill and companion skills under `.claude/skills/jinja/`
@@ -77,6 +77,9 @@ uv run python main.py run \
   https://github.com/twilwa/api-design-skills-package-v2 \
   --target-work-area https://github.com/twilwa/gskill \
   --seed-only
+
+# Explicitly select task sources (repeat --task-source to combine more than one)
+uv run python main.py run https://github.com/pallets/jinja --task-source swe-smith
 
 # Save a holdout test-set summary after optimization
 uv run python main.py run https://github.com/pallets/jinja --run-test-eval --test-eval-limit 10
@@ -121,7 +124,7 @@ The optimized skill is written to:
 ```
 
 The primary skill is always the root `SKILL.md`. The companion skills are additional capabilities extracted from the source corpus and listed in `skill-suite.json`.
-`run-report.json` records the run configuration, validation score, and optional holdout test summary.
+`run-report.json` records the run configuration, task-bundle provenance, validation score, and optional holdout test summary.
 
 ## Task runner
 
@@ -143,7 +146,7 @@ gskill/
 ├── main.py              # CLI entry point (typer)
 ├── src/
 │   ├── pipeline.py      # Top-level orchestration
-│   ├── tasks.py         # SWE-smith dataset loading & splitting
+│   ├── tasks.py         # Canonical task types, task sources, and bundle assembly
 │   ├── evaluator.py     # mini runner + pass/fail evaluation
 │   └── skill.py         # Seed generation, augmentation, and skill-suite persistence
 ├── Taskfile.yml         # Task runner shortcuts

@@ -1,86 +1,151 @@
-# CLAUDE.md
+# Claude Repo Notes
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is the Claude-facing quick reference for this repository.
+If this file and `AGENTS.md` diverge, follow `AGENTS.md`.
 
-## Project Overview
+## Default Behavior
 
-`gskill` automatically learns repository-specific skills for coding agents via evolutionary search. It:
-1. Loads SWE-smith tasks for a target GitHub repository
-2. Optionally generates an initial `SKILL.md` via gpt-5.2
-using the repo's README and config files
-3. Uses GEPA (evolutionary prompt optimization) with mini-SWE-Agent to iteratively improve the skill
-4. Saves the best-scoring `SKILL.md` to `.claude/skills/<repo>/SKILL.md`
+- Strict Mode by default.
+- OpenSpec by default.
+- `br` always for task tracking.
+- `mise` always for tools/tasks/envs.
+- `sg` for code search, not plain grep.
+- `sem diff` whenever possible for review.
+- GitButler instead of `jj`.
 
-## Project Management
+## Conditional reminders
 
-This project uses **uv** for Python package and environment management (Python 3.13). Do not use `pip`, `python`, or manual venv activation directly.
+These blocks sharpen task-specific behavior. `AGENTS.md` remains the source of
+truth if anything here is incomplete.
 
-```bash
-uv run main.py <repo-url>   # Run the main pipeline
-uv add <package>            # Add a dependency
-uv remove <package>         # Remove a dependency
-uv sync                     # Install dependencies from lockfile
-uv run pytest               # Run tests
-uv run ruff check .         # Lint
-uv run ruff format .        # Format
-```
+<important if="you are starting work, planning, or updating specs">
+- OpenSpec first unless the human explicitly says `Full Yolo`.
+- Encode execution order and dependencies in `br` before implementation.
+- Default to Strict Mode and bounded fan-out.
+</important>
 
-A **Taskfile.yml** (requires [Task](https://taskfile.dev)) provides shortcuts for common operations:
+<important if="you are writing or modifying code">
+- Use TDD: red -> green -> refactor.
+- Start with clear names, interfaces, and docstrings that fit repo conventions.
+- Use smaller subagents on separable workstreams.
+</important>
 
-```bash
-task sync                # uv sync
-task lint                # ruff check
-task format              # ruff format
-task test                # pytest
-task run -- owner/repo   # gskill run (pass args via CLI_ARGS)
-task tasks               # gskill tasks (pass args via CLI_ARGS)
-```
+<important if="you are writing or modifying tests">
+- Test real behavior, not mocked behavior under test.
+- Aim for unit, integration, and end-to-end coverage on touched behavior.
+- Clean logs and deterministic output are part of passing.
+</important>
 
-## Entry Point & CLI
+<important if="you are reviewing, verifying, or handing off work">
+- Prefer `sem diff` over plain text diffs when possible.
+- Run compressed verification during iteration and full verification before handoff.
+- Report the actual verification state, not the intended one.
+</important>
 
-`main.py` is the CLI entry point (registered as the `gskill` script). It exposes two Typer commands:
+<important if="you are touching branches, commits, or git status">
+- Use `but`, not `git` or `jj`, for repo version-control workflows.
+- Hidden tool directories can churn during normal operation; confirm before escalating routine `.beads/`, `.entire/`, `.trunk/`, `.mise/`, or `.tools/` changes.
+- Never bypass hooks or rewrite history without explicit approval.
+</important>
 
-- `gskill run <repo-url>` — run the full optimization pipeline
-  - `--output-dir` / `-o`: where to write `SKILL.md` (default: `.claude/skills`)
-  - `--max-evals` / `-n`: GEPA evaluation budget (default: 150)
-  - `--no-initial-skill`: skip gpt-5.2 seed generation, start GEPA from empty
-  - `--agent-model` / `-m`: LiteLLM model string for mini-SWE-agent (e.g. `openai/gpt-5.2`); falls back to `GSKILL_AGENT_MODEL` env var, then `openai/gpt-5.2`
-- `gskill tasks <owner/repo>` — list available SWE-smith tasks for a repo
-  - `--limit` / `-l`: number of tasks to show (default: 10)
-  - `--list`: list all tasks up to limit
+## Preferred Execution Order
 
-## Project Structure
+1. understand intent
+2. update OpenSpec (unless Full Yolo)
+3. create/update `br` tasks and dependencies
+4. plan and parallelize
+5. fan out bounded work to smaller models/subagents
+6. TDD red -> green -> refactor
+7. run compressed verification during iteration
+8. run full verification before handoff
 
-```
-gskill/
-├── main.py           # CLI entry point (Typer app, two commands: run + tasks)
-├── src/
-│   ├── __init__.py   # Empty package init
-│   ├── pipeline.py   # Top-level orchestration: load tasks → generate seed → GEPA → save
-│   ├── skill.py      # Initial skill generation (gpt-5.2 via OpenAI) + save_skill()
-│   ├── tasks.py      # SWE-smith dataset loading and train/val/test splitting
-│   └── evaluator.py  # GEPA-compatible evaluator: runs mini-SWE-Agent + Docker test verification
-├── Taskfile.yml      # Task runner shortcuts (requires Task)
-└── pyproject.toml    # Dependencies: typer, openai, datasets, mini-swe-agent, gepa (git)
-```
+## Mode Rules
 
-## Key Dependencies
+### Strict Mode
 
-- **gepa** (git): evolutionary prompt optimization framework — `optimize_anything()` drives the search
-- **mini-swe-agent**: runs the coding agent inside Docker SWE-bench containers
-- **openai**: used in `skill.py` for gpt-5.2 initial skill generation (requires `OPENAI_API_KEY`)
-- **datasets**: loads `SWE-bench/SWE-smith` from HuggingFace Hub
-- **typer**: CLI framework
+- Human approval before implementation.
+- Full spec discipline.
+- Full TDD and verification discipline.
 
-## External Requirements
+### Yolo Mode
 
-- Docker must be running — `evaluator.py` spins up SWE-bench Docker containers to verify patches
-- `OPENAI_API_KEY` env var for initial skill generation (skippable via `--no-initial-skill`)
-- `GSKILL_AGENT_MODEL` env var (optional) — sets the LiteLLM model for mini-SWE-agent; overridden by `--agent-model` flag; defaults to `openai/gpt-5.2`
+- Must be explicitly requested.
+- Keeps `br`, TDD, and verification.
+- Reduces ceremony, not quality.
 
-## Module Responsibilities
+### Full Yolo
 
-- **`pipeline.py`**: Parses repo URL → loads tasks → calls `generate_initial_skill` → builds GEPA evaluator → runs `optimize_anything` → saves best skill
-- **`skill.py`**: Fetches README + config files from GitHub API; calls gpt-5.2 to generate initial `SKILL.md`; `save_skill()` writes to `<output_dir>/<repo>/SKILL.md`
-- **`tasks.py`**: Loads `SWE-bench/SWE-smith` dataset, filters by repo slug (`owner__repo`), splits 67/17/16% train/val/test
-- **`evaluator.py`**: `make_evaluator(agent_model=None)` returns a GEPA-compatible `(candidate, task) → (score, info)` function; runs mini-SWE-Agent with the candidate skill injected into the system prompt, applies the resulting patch in Docker, runs `FAIL_TO_PASS` tests (up to 10), returns 1.0 if all pass
+- Must be explicitly requested by name.
+- May skip OpenSpec.
+- Still keeps `br`, tests, and verification.
+
+## Tool Quick Reference
+
+### `br`
+
+- `br ready` — find unblocked work
+- `br create "..."` — create task
+- `br show <id>` — inspect task
+- `br update <id> --status in_progress` — claim work
+- `br dep add <issue> <depends-on>` — encode dependency
+- `br close <id>` — close task
+- `br sync --flush-only` — export bead data
+
+### `bv`
+
+- Use to inspect graph shape, blockers, and the critical path.
+
+### OpenSpec
+
+- Use first for spec-driven work unless in Full Yolo.
+
+### `sem`
+
+- Prefer `sem diff` over `git diff` for code review.
+
+### `sg`
+
+- Use for code search and structural rewrites.
+- Only use plain-text grep for docs, logs, and prose.
+
+### `mise`
+
+- `mise install` — sync toolchain
+- `mise run <task>` — run project task
+- `mise tasks ls` — inspect available tasks
+
+### `linctl`
+
+- Use for human/team reporting and Linear workflows.
+- Do not use it as a replacement for `br`.
+
+### `entire`
+
+- `entire enable` at project start if not already enabled.
+
+### GitButler
+
+- Preferred branch orchestration model here.
+- No `jj` workspaces, rebases, or parallelize flows.
+
+## Safety Rules
+
+- Do not assume Yolo/Full Yolo.
+- Do not bypass verification.
+- Do not rewrite history unless explicitly asked.
+- Do not let subagents overlap file ownership without coordination.
+- Do not claim checks you did not run.
+
+## Ask First
+
+- dependency changes
+- CI/release changes
+- security/auth changes
+- migrations or data-shape changes
+- destructive git actions
+- weakening test or review gates
+
+## Planning Helpers
+
+- If `agent-brief` or `robots` exists in the active harness, use them for deeper planning and fan-out.
+- If they do not exist, proceed with the repo workflow above.

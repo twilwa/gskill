@@ -1,8 +1,9 @@
-"""Tests for evaluator command selection."""
+"""Tests for evaluator command selection and task runner behavior."""
 
 from __future__ import annotations
 
-from src.evaluator import _build_test_command
+from src.evaluator import _build_test_command, make_evaluator
+from src.tasks import EnvironmentSpec, TaskSpec, VerifierSpec
 
 
 def test_build_test_command_for_pytest_tasks():
@@ -29,3 +30,23 @@ def test_build_test_command_for_go_tasks():
     assert mode == "go_test"
     assert "go test ./..." in command
     assert "TestGeoDistanceIssue1301|ExampleNew" in command
+
+
+def test_evaluator_reports_unsupported_runner_for_non_swebench_tasks():
+    evaluator = make_evaluator(agent_model="openai/test-model")
+    task = TaskSpec(
+        id="local-1",
+        family="terminal",
+        source="repo-terminal",
+        repo_name="acme/commerce-api",
+        problem_statement="Run the local verification command.",
+        environment=EnvironmentSpec(kind="local_checkout", ref="HEAD"),
+        verifier=VerifierSpec(kind="shell_command", commands=("mise run check",)),
+        metadata={},
+    )
+
+    score, info = evaluator("candidate skill", task)
+
+    assert score == 0.0
+    assert info["instance_id"] == "local-1"
+    assert info["test_failure_reason"] == "unsupported_runner"

@@ -1,0 +1,83 @@
+"""Tests for canonical task loading and bundle assembly."""
+
+from __future__ import annotations
+
+import pytest
+
+from src import tasks
+
+
+def test_swe_smith_source_collects_canonical_tasks(monkeypatch):
+    rows = [
+        {
+            "instance_id": "jinja-1",
+            "repo": "swesmith/pallets__jinja.ada0a9a6",
+            "problem_statement": "Fix template rendering.",
+            "image_name": "swebench/jinja:latest",
+            "FAIL_TO_PASS": ["tests/test_core.py::test_render"],
+            "PASS_TO_PASS": ["tests/test_core.py::test_keep_working"],
+        }
+    ]
+
+    monkeypatch.setattr(tasks, "load_dataset", lambda name, split: rows)
+
+    source = tasks.get_task_source("swe-smith")
+    collected = source.collect("pallets/jinja", limit=1)
+
+    assert len(collected) == 1
+    task = collected[0]
+    assert task.id == "jinja-1"
+    assert task.source == "swe-smith"
+    assert task.family == "benchmark"
+    assert task.problem_statement == "Fix template rendering."
+    assert task.environment.kind == "swebench_docker"
+    assert task.environment.ref == "swesmith/pallets__jinja.ada0a9a6"
+    assert task.verifier.kind == "test_selectors"
+    assert task.verifier.selectors == ["tests/test_core.py::test_render"]
+    assert task.metadata["image_name"] == "swebench/jinja:latest"
+
+
+def test_build_task_bundle_records_source_counts(monkeypatch):
+    collected = [
+        tasks.TaskSpec(
+            id=f"task-{index}",
+            family="benchmark",
+            source="swe-smith",
+            repo_name="acme/commerce-api",
+            problem_statement=f"Problem {index}",
+            environment=tasks.EnvironmentSpec(kind="swebench_docker", ref=f"ref-{index}"),
+            verifier=tasks.VerifierSpec(kind="test_selectors", selectors=[f"tests/test_{index}.py::test_case"]),
+            metadata={"index": index},
+        )
+        for index in range(5)
+    ]
+
+    class FakeSource:
+        name = "swe-smith"
+
+        def collect(self, repo_name: str, limit: int = 300):
+            assert repo_name == "acme/commerce-api"
+            assert limit == 5
+            return collected
+
+    monkeypatch.setattr(tasks, "get_task_source", lambda name: FakeSource())
+
+    bundle = tasks.build_task_bundle(
+        repo_name="acme/commerce-api",
+        source_names=["swe-smith"],
+        limit=5,
+    )
+
+    assert [task.id for task in bundle.tasks] == [task.id for task in collected]
+    assert len(bundle.train) == 3
+    assert len(bundle.val) == 0
+    assert len(bundle.test) == 2
+    assert bundle.provenance["source_counts"] == {"swe-smith": 5}
+
+
+def test_build_task_bundle_rejects_unknown_sources():
+    with pytest.raises(ValueError, match="Unknown task source"):
+        tasks.build_task_bundle(
+            repo_name="acme/commerce-api",
+            source_names=["does-not-exist"],
+        )

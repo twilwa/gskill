@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import tempfile
 import textwrap
+import warnings
 from pathlib import Path
 from typing import Callable
 
@@ -20,6 +21,8 @@ from minisweagent.run.benchmarks.swebench import (
 )
 from minisweagent.utils.serialize import recursive_merge
 
+from .tasks import TaskSpec
+
 _SWEBENCH_CONFIG = builtin_config_dir / "benchmarks" / "swebench.yaml"
 
 # Base system prompt that frames the skill content
@@ -28,6 +31,18 @@ _SYSTEM_PREFIX = (
     "to solve programming tasks.\n\n"
     "# Repository-Specific Knowledge\n\n"
 )
+
+
+def _log(message: str) -> None:
+    """Log through GEPA without surfacing warnings in direct unit tests."""
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"oa\.log\(\) called outside of an evaluator function\..*",
+            category=UserWarning,
+        )
+        oa.log(message)
 
 
 def _write_skill_config(skill: str) -> Path:
@@ -99,15 +114,15 @@ def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
     """
     fail_to_pass: list[str] = instance.get("FAIL_TO_PASS", [])
     if not fail_to_pass:
-        oa.log("No FAIL_TO_PASS tests found, skipping test run")
+        _log("No FAIL_TO_PASS tests found, skipping test run")
         return False, "no_fail_to_pass_tests"
 
     image_name = get_swebench_docker_image_name(instance)
-    oa.log(f"Test container image: {image_name}")
+    _log(f"Test container image: {image_name}")
 
     test_command, test_mode = _build_test_command(instance)
     if not test_command:
-        oa.log("No runnable test command could be inferred from FAIL_TO_PASS metadata")
+        _log("No runnable test command could be inferred from FAIL_TO_PASS metadata")
         return False, "no_test_command"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
@@ -139,18 +154,18 @@ def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
         )
         passed = result.returncode == 0
         stdout_tail = result.stdout[-500:] if result.stdout else ""
-        oa.log(f"Test stdout tail: {stdout_tail}")
+        _log(f"Test stdout tail: {stdout_tail}")
         if not passed:
-            oa.log(
+            _log(
                 f"Tests failed (exit {result.returncode}) mode={test_mode} for image={image_name}; "
                 f"stderr: {result.stderr[-200:] if result.stderr else '(none)'}"
             )
         return passed, f"{test_mode}_passed" if passed else f"{test_mode}_failed"
     except subprocess.TimeoutExpired:
-        oa.log(f"Test run timed out (180s) for image={image_name}")
+        _log(f"Test run timed out (180s) for image={image_name}")
         return False, f"{test_mode}_timeout"
     except FileNotFoundError:
-        oa.log(
+        _log(
             "Docker executable not found; ensure Docker is installed and running. "
             "All evaluations will score 0.0 until Docker is available."
         )
@@ -159,9 +174,37 @@ def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
         os.unlink(patch_file)
 
 
+def _task_instance_id(task: TaskSpec | dict) -> str:
+    """Return a stable task identifier for logging and reports."""
+
+    if isinstance(task, TaskSpec):
+        return task.id
+    return task.get("instance_id", "unknown")
+
+
+def _task_problem_statement(task: TaskSpec | dict) -> str:
+    """Return the problem statement regardless of task representation."""
+
+    if isinstance(task, TaskSpec):
+        return task.problem_statement
+    return task["problem_statement"]
+
+
+def _task_to_swebench_instance(task: TaskSpec | dict) -> dict | None:
+    """Return raw SWE-bench-style metadata for supported canonical tasks."""
+
+    if isinstance(task, dict):
+        return task
+    if task.environment.kind != "swebench_docker" or task.verifier.kind != "test_selectors":
+        return None
+    if task.source != "swe-smith":
+        return None
+    return dict(task.metadata)
+
+
 def make_evaluator(
     agent_model: str | None = None,
-) -> Callable[[str, dict], tuple[float, dict]]:
+) -> Callable[[str, TaskSpec | dict], tuple[float, dict]]:
     """Create a GEPA-compatible evaluator that runs mini-SWE-Agent on a SWE-smith task.
 
     The returned evaluator:
@@ -182,7 +225,19 @@ def make_evaluator(
         "GSKILL_AGENT_MODEL", "openai/gpt-5.2"
     )
 
-    def evaluate(candidate_skill: str, task: dict) -> tuple[float, dict]:
+    def evaluate(candidate_skill: str, task: TaskSpec | dict) -> tuple[float, dict]:
+        instance_id = _task_instance_id(task)
+        instance = _task_to_swebench_instance(task)
+        if instance is None:
+            _log(f"instance={instance_id} unsupported runner for canonical task")
+            return 0.0, {
+                "instance_id": instance_id,
+                "patch_chars": 0,
+                "score": 0.0,
+                "error": "",
+                "test_failure_reason": "unsupported_runner",
+            }
+
         skill_config_path = _write_skill_config(candidate_skill)
         traj_tmp = tempfile.NamedTemporaryFile(
             suffix=".traj.json", delete=False, prefix="gskill_traj_"
@@ -204,18 +259,18 @@ def make_evaluator(
             ]
             config = recursive_merge(*configs)
 
-            env = get_sb_environment(config, task)
+            env = get_sb_environment(config, instance)
             model = get_model(config=config.get("model", {}))
             agent = get_agent(
                 model, env, config.get("agent", {}), default_type="default"
             )
 
-            result = agent.run(task["problem_statement"])
+            result = agent.run(_task_problem_statement(task))
             patch = result.get("submission", "") or ""
 
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
-            oa.log(f"Mini run error: {error_msg}")
+            _log(f"Mini run error: {error_msg}")
         finally:
             if env is not None:
                 env.cleanup()
@@ -226,21 +281,21 @@ def make_evaluator(
                     pass
 
         if patch.strip():
-            passed, test_reason = _run_tests(task, patch)
+            passed, test_reason = _run_tests(instance, patch)
             score = 1.0 if passed else 0.0
-            oa.log(
-                f"instance={task.get('instance_id')} patch={len(patch)}chars "
+            _log(
+                f"instance={instance_id} patch={len(patch)}chars "
                 f"tests={'passed' if passed else 'failed'} reason={test_reason} score={score}"
             )
         else:
             test_reason = "no_patch_submitted"
-            oa.log(
-                f"instance={task.get('instance_id')} no patch submitted score=0.0"
+            _log(
+                f"instance={instance_id} no patch submitted score=0.0"
                 + (f"; agent error: {error_msg}" if error_msg else "")
             )
 
         return score, {
-            "instance_id": task.get("instance_id", "unknown"),
+            "instance_id": instance_id,
             "patch_chars": len(patch),
             "score": score,
             "error": error_msg,

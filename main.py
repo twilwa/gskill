@@ -70,6 +70,14 @@ def run(
         "--allow-missing-tasks",
         help="If SWE-smith has no tasks for the repo, save the seed skill and exit successfully.",
     ),
+    task_sources: list[str] | None = typer.Option(
+        None,
+        "--task-source",
+        help=(
+            "Named task source to use when building the optimization bundle. "
+            "Repeat the flag to combine multiple sources. Defaults to the registered SWE-smith source."
+        ),
+    ),
     augment_suite: bool = typer.Option(
         True,
         "--augment-suite/--no-augment-suite",
@@ -103,6 +111,7 @@ def run(
         target_work_area=target_work_area or None,
         seed_only=seed_only,
         allow_missing_tasks=allow_missing_tasks,
+        task_sources=task_sources or None,
         augment_suite=augment_suite,
         run_test_eval=run_test_eval,
         test_eval_limit=test_eval_limit or None,

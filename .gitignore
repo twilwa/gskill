@@ -12,3 +12,13 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Bootstrap runtime data
+.mise/
+.tools/
+.entire/
+.jj/
+.beads/dolt-server.*
+scratchpad/*
+!scratchpad/.gitkeep
+# End bootstrap runtime data

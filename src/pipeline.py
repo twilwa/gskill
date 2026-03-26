@@ -15,7 +15,7 @@ from .skill import (
     generate_initial_skill_suite,
     save_skill_suite,
 )
-from .tasks import load_tasks, split_tasks
+from .tasks import build_task_bundle
 
 
 def _extract_repo_name(repo_url: str) -> str:
@@ -74,6 +74,7 @@ def run(
     target_work_area: str | None = None,
     seed_only: bool = False,
     allow_missing_tasks: bool = False,
+    task_sources: list[str] | None = None,
     augment_suite: bool = True,
     run_test_eval: bool = False,
     test_eval_limit: int | None = None,
@@ -98,6 +99,8 @@ def run(
         seed_only: If True, only generate and save the initial skill suite.
         allow_missing_tasks: If True, save the seed skill and exit when the
             repository is not present in SWE-smith.
+        task_sources: Optional named task sources to use when building the
+            optimization bundle. Defaults to the registered SWE-smith source.
         augment_suite: If True, generate companion skills after the primary
             workflow skill is seeded or optimized.
         run_test_eval: If True, evaluate the best candidate on the holdout test split.
@@ -160,9 +163,12 @@ def run(
             "manifest_path": str(manifest_path) if manifest_path else None,
         }
 
-    print("[gskill] Loading tasks from SWE-smith...")
+    print("[gskill] Loading tasks from task sources...")
     try:
-        tasks = load_tasks(target_repo_name)
+        task_bundle = build_task_bundle(
+            repo_name=target_repo_name,
+            source_names=task_sources,
+        )
     except ValueError as exc:
         if allow_missing_tasks:
             if manifest_path:
@@ -184,7 +190,7 @@ def run(
                 "reason": str(exc),
             }
         raise
-    train, val, test = split_tasks(tasks)
+    train, val, test = task_bundle.train, task_bundle.val, task_bundle.test
     print(f"[gskill] Tasks: {len(train)} train / {len(val)} val / {len(test)} test")
 
     evaluator = make_evaluator(agent_model=agent_model)
@@ -277,6 +283,10 @@ def run(
         "train_tasks": len(train),
         "val_tasks": len(val),
         "test_tasks": len(test),
+        "task_bundle": {
+            **task_bundle.provenance,
+            "rejections": task_bundle.rejections,
+        },
         "best_val_score": best_score,
         "seed_used": seed_candidate is not None,
         "augment_suite": augment_suite,
