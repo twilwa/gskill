@@ -51,6 +51,43 @@ def run(
         "-u",
         help="OpenAI-compatible base URL for local models (e.g. http://localhost:11434/v1). Env: OPENAI_BASE_URL.",
     ),
+    target_work_area: str = typer.Option(
+        "",
+        "--target-work-area",
+        "-t",
+        help=(
+            "Optional GitHub repo URL or owner/repo string for the repository where the agent "
+            "will continue working. SWE-smith tasks are loaded for this repo."
+        ),
+    ),
+    seed_only: bool = typer.Option(
+        False,
+        "--seed-only",
+        help="Generate and save a seed skill without SWE-smith tasks or GEPA optimization.",
+    ),
+    allow_missing_tasks: bool = typer.Option(
+        False,
+        "--allow-missing-tasks",
+        help="If SWE-smith has no tasks for the repo, save the seed skill and exit successfully.",
+    ),
+    augment_suite: bool = typer.Option(
+        True,
+        "--augment-suite/--no-augment-suite",
+        help=(
+            "Generate companion skills in addition to the primary workflow skill. "
+            "These companions capture reusable development capabilities from the source corpus."
+        ),
+    ),
+    run_test_eval: bool = typer.Option(
+        False,
+        "--run-test-eval/--no-test-eval",
+        help="Evaluate the best candidate on the holdout test split and save the summary to run-report.json.",
+    ),
+    test_eval_limit: int = typer.Option(
+        0,
+        "--test-eval-limit",
+        help="Optional cap on the number of holdout test tasks to evaluate. 0 means use the full split.",
+    ),
 ) -> None:
     """Run the gskill pipeline: optimize a SKILL.md for the given repository."""
     from src.pipeline import run as _run
@@ -63,6 +100,12 @@ def run(
         agent_model=agent_model or None,
         skill_model=skill_model or None,
         base_url=base_url or None,
+        target_work_area=target_work_area or None,
+        seed_only=seed_only,
+        allow_missing_tasks=allow_missing_tasks,
+        augment_suite=augment_suite,
+        run_test_eval=run_test_eval,
+        test_eval_limit=test_eval_limit or None,
     )
 
 

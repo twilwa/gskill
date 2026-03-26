@@ -1,6 +1,8 @@
 """Mini-SWE-Agent evaluator for GEPA multi-task search."""
 
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -40,6 +42,49 @@ def _write_skill_config(skill: str) -> Path:
     return Path(tmp.name)
 
 
+def _build_test_command(instance: dict, max_tests: int = 10) -> tuple[str, str]:
+    """Build a repo-aware test command from SWE-smith task metadata."""
+    fail_to_pass: list[str] = instance.get("FAIL_TO_PASS", [])[:max_tests]
+    if not fail_to_pass:
+        return "", "no_tests"
+
+    repo_hint = " ".join(
+        str(instance.get(key, "")) for key in ("repo", "image_name", "instance_id")
+    ).lower()
+    quoted_ids = " ".join(shlex.quote(test_id) for test_id in fail_to_pass)
+
+    if any(".py::" in test_id or test_id.endswith(".py") for test_id in fail_to_pass):
+        return f"python -m pytest {quoted_ids} -x --tb=no -q 2>&1", "pytest"
+
+    if all(re.fullmatch(r"(Test|Example|Benchmark)[A-Za-z0-9_]+", test_id) for test_id in fail_to_pass):
+        pattern = "|".join(re.escape(test_id) for test_id in fail_to_pass)
+        return (
+            f"go test ./... -run '^{pattern}$' -count=1 2>&1",
+            "go_test",
+        )
+
+    if "cargo" in repo_hint or "rust" in repo_hint:
+        return (
+            f"cargo test {' '.join(shlex.quote(test_id) for test_id in fail_to_pass)} -- --nocapture 2>&1",
+            "cargo_test",
+        )
+
+    adaptive = textwrap.dedent(
+        f"""\
+        if [ -f go.mod ]; then
+            go test ./... -count=1 2>&1
+        elif [ -f Cargo.toml ]; then
+            cargo test -- --nocapture 2>&1
+        elif [ -f package.json ]; then
+            npm test -- --runInBand 2>&1 || npm test 2>&1
+        else
+            python -m pytest {quoted_ids} -x --tb=no -q 2>&1
+        fi
+        """
+    ).strip()
+    return adaptive, "adaptive"
+
+
 def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
     """Apply the agent's patch and run FAIL_TO_PASS tests in a fresh Docker container.
 
@@ -60,9 +105,10 @@ def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
     image_name = get_swebench_docker_image_name(instance)
     oa.log(f"Test container image: {image_name}")
 
-    # Limit to 10 tests to keep evaluation fast
-    test_ids = fail_to_pass[:10]
-    test_args = " ".join(f'"{t}"' for t in test_ids)
+    test_command, test_mode = _build_test_command(instance)
+    if not test_command:
+        oa.log("No runnable test command could be inferred from FAIL_TO_PASS metadata")
+        return False, "no_test_command"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
         f.write(patch)
@@ -71,7 +117,7 @@ def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
     test_cmd = textwrap.dedent(f"""\
         cd /testbed
         git apply /tmp/solution.patch 2>/dev/null || patch -p1 < /tmp/solution.patch 2>/dev/null
-        python -m pytest {test_args} -x --tb=no -q 2>&1
+        {test_command}
     """)
 
     try:
@@ -96,13 +142,13 @@ def _run_tests(instance: dict, patch: str) -> tuple[bool, str]:
         oa.log(f"Test stdout tail: {stdout_tail}")
         if not passed:
             oa.log(
-                f"Tests failed (exit {result.returncode}) for image={image_name}; "
+                f"Tests failed (exit {result.returncode}) mode={test_mode} for image={image_name}; "
                 f"stderr: {result.stderr[-200:] if result.stderr else '(none)'}"
             )
-        return passed, "tests_passed" if passed else "tests_failed"
+        return passed, f"{test_mode}_passed" if passed else f"{test_mode}_failed"
     except subprocess.TimeoutExpired:
         oa.log(f"Test run timed out (180s) for image={image_name}")
-        return False, "test_timeout"
+        return False, f"{test_mode}_timeout"
     except FileNotFoundError:
         oa.log(
             "Docker executable not found; ensure Docker is installed and running. "

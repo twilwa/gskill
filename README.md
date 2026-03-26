@@ -2,20 +2,30 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Claude](https://img.shields.io/badge/Claude-D97757?logo=claude&logoColor=fff)](https://claude.ai/code)
-![Last Commit](https://img.shields.io/github/last-commit/itsmostafa/gskill)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/itsmostafa/gskill/pulls)
+![Last Commit](https://img.shields.io/github/last-commit/twilwa/gskill)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/twilwa/gskill/pulls)
 
 Automatically learns repository-specific skills for coding agents using evolutionary search.
 
-Given a GitHub repository, gskill produces a `.claude/skills/{repo}/SKILL.md` file containing optimized instructions that dramatically improve an agent's resolve rate on that repo's issues. It implements the pipeline described in the [GEPA blog post](https://gepa-ai.github.io/gepa/blog/2026/02/18/automatically-learning-skills-for-coding-agents/), which demonstrated improvements from 24% → 93% resolve rate on some repositories.
+Given a GitHub repository, gskill produces a skill package for agents:
+
+- a primary workflow skill at `.claude/skills/{repo}/SKILL.md`
+- a `skill-suite.json` manifest
+- optional companion skills that capture transferable capabilities extracted from the source corpus
+
+The primary workflow skill is what GEPA optimizes. Companion skills are added in a follow-up augmentation pass so the final package can tell an agent both how to work in the repo and what reusable engineering capabilities matter for that kind of work.
+
+It implements the pipeline described in the [GEPA blog post](https://gepa-ai.github.io/gepa/blog/2026/02/18/automatically-learning-skills-for-coding-agents/), which demonstrated improvements from 24% → 93% resolve rate on some repositories.
 
 ## How it works
 
-1. Loads verifiable software engineering tasks from [SWE-smith](https://huggingface.co/datasets/SWE-bench/SWE-smith) for the target repository
-2. Generates an initial skill via static analysis of the repo (README, config files) + gpt 5.2.
-3. Uses [GEPA](https://github.com/gepa-ai/gepa)'s `optimize_anything` to iteratively refine the skill through evolutionary search
-4. Each candidate skill is evaluated by running [mini-SWE-agent](https://mini-swe-agent.com) on training tasks inside Docker and checking whether the FAIL_TO_PASS tests pass
-5. Writes the best-scoring skill to disk
+1. Reads a source corpus repository and generates an initial workflow skill from its README plus high-signal repo files
+2. Optionally treats a different repository as the target work area via `--target-work-area`
+3. Loads verifiable software engineering tasks from [SWE-smith](https://huggingface.co/datasets/SWE-bench/SWE-smith) for the target work area
+4. Uses [GEPA](https://github.com/gepa-ai/gepa)'s `optimize_anything` to iteratively refine the primary workflow skill through evolutionary search
+5. Runs an augmentation pass to generate companion skills grounded in the source corpus
+6. Can evaluate the best candidate on a holdout test split
+7. Writes the skill suite plus a run report to disk
 
 ## Requirements
 
@@ -28,7 +38,7 @@ Given a GitHub repository, gskill produces a `.claude/skills/{repo}/SKILL.md` fi
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/gskill
+git clone https://github.com/twilwa/gskill
 cd gskill
 uv sync
 ```
@@ -43,9 +53,9 @@ uv run python main.py run https://github.com/pallets/jinja
 
 This will:
 - Load SWE-smith tasks for `pallets/jinja`
-- Generate an initial skill
-- Run up to 150 mini evaluations to optimize the skill
-- Write the result to `.claude/skills/jinja/SKILL.md`
+- Generate an initial workflow skill
+- Run up to 150 mini evaluations to optimize the workflow skill
+- Write the primary skill and companion skills under `.claude/skills/jinja/`
 
 ### Common options
 
@@ -58,6 +68,18 @@ uv run python main.py run https://github.com/pallets/jinja --output-dir ~/skills
 
 # Skip static analysis, start from an empty seed
 uv run python main.py run https://github.com/pallets/jinja --no-initial-skill
+
+# Generate only the seed suite without SWE-smith optimization
+uv run python main.py run https://github.com/pallets/jinja --seed-only
+
+# Use one repo as a source corpus and a different repo as the actual work area
+uv run python main.py run \
+  https://github.com/twilwa/api-design-skills-package-v2 \
+  --target-work-area https://github.com/twilwa/gskill \
+  --seed-only
+
+# Save a holdout test-set summary after optimization
+uv run python main.py run https://github.com/pallets/jinja --run-test-eval --test-eval-limit 10
 
 # Use a different model for the coding agent
 uv run python main.py run https://github.com/pallets/jinja --agent-model openai/gpt-5-mini
@@ -93,9 +115,13 @@ The optimized skill is written to:
 
 ```
 .claude/skills/{repo}/SKILL.md
+.claude/skills/{repo}/skill-suite.json
+.claude/skills/{repo}/run-report.json
+.claude/skills/{repo}/{companion-skill}/SKILL.md
 ```
 
-To use it with Claude Code, add the skill path to your project's `.claude/settings.json` or reference it from your `CLAUDE.md`.
+The primary skill is always the root `SKILL.md`. The companion skills are additional capabilities extracted from the source corpus and listed in `skill-suite.json`.
+`run-report.json` records the run configuration, validation score, and optional holdout test summary.
 
 ## Task runner
 
@@ -119,7 +145,7 @@ gskill/
 │   ├── pipeline.py      # Top-level orchestration
 │   ├── tasks.py         # SWE-smith dataset loading & splitting
 │   ├── evaluator.py     # mini runner + pass/fail evaluation
-│   └── skill.py         # Initial skill generation (gpt-5.2) + file I/O
+│   └── skill.py         # Seed generation, augmentation, and skill-suite persistence
 ├── Taskfile.yml         # Task runner shortcuts
 └── pyproject.toml
 ```
