@@ -44,6 +44,18 @@ lint:
     - trufflehog@3.93.3
     - yamllint@1.38.0
 actions:
+  definitions:
+    - id: trunk-fmt-pre-commit
+      description: Run 'trunk fmt' whenever you run 'git commit'
+      display_name: Trunk Fmt Pre-Commit Hook
+      runtime_environment:
+        - name: GIT_INDEX_FILE
+          value: ${env.GIT_INDEX_FILE}
+      run: bash -lc 'trunk fmt -t "git-commit" --index-file "$GIT_INDEX_FILE" --upstream=HEAD'
+      interactive: optional
+      triggers:
+        - git_hooks: [pre-commit]
+      notify_on_error: false
   enabled:
     - trunk-announce
     - trunk-check-pre-push

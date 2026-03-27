@@ -62,6 +62,52 @@ def test_evaluator_reports_unsupported_runner_for_non_swebench_tasks():
     assert info["test_failure_reason"] == "unsupported_runner"
 
 
+def test_evaluator_defaults_to_gpt_5_4_when_model_is_not_overridden(
+    monkeypatch, tmp_path
+):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    observed_model_names: list[str] = []
+
+    class FakeAgent:
+        def run(self, prompt: str):
+            return {"submission": ""}
+
+    def fake_get_environment(config, default_type="local"):
+        return object()
+
+    def fake_get_model(config=None):
+        observed_model_names.append(config["model_name"])
+        return object()
+
+    def fake_get_agent(model, env, config, default_type="default"):
+        return FakeAgent()
+
+    monkeypatch.delenv("GSKILL_AGENT_MODEL", raising=False)
+    monkeypatch.setattr("src.evaluator.get_environment", fake_get_environment)
+    monkeypatch.setattr("src.evaluator.get_model", fake_get_model)
+    monkeypatch.setattr("src.evaluator.get_agent", fake_get_agent)
+    monkeypatch.setattr("src.evaluator._task_submission_patch", lambda *_: "")
+
+    evaluator = make_evaluator()
+    task = TaskSpec(
+        id="local-default-model",
+        family="mutation",
+        source="python-mutation",
+        repo_name="acme/commerce-api",
+        problem_statement="Return no patch.",
+        environment=EnvironmentSpec(kind="local_checkout", ref=str(snapshot)),
+        verifier=VerifierSpec(kind="shell_command", commands=("echo verify",)),
+        metadata={"snapshot_path": str(snapshot)},
+    )
+
+    score, info = evaluator("candidate skill", task)
+
+    assert score == 0.0
+    assert info["test_failure_reason"] == "no_patch_submitted"
+    assert observed_model_names == ["openai/gpt-5.4"]
+
+
 def test_evaluator_runs_local_checkout_tasks_in_a_copied_snapshot(monkeypatch, tmp_path):
     checkout = tmp_path / "checkout"
     (checkout / "src").mkdir(parents=True)
