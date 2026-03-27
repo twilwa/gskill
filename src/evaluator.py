@@ -925,14 +925,14 @@ def make_evaluator(
       5. Returns (score, side_info) for GEPA reflection.
 
     Args:
-        agent_model: LiteLLM model string for mini-SWE-agent (e.g. ``openai/gpt-5.2``).
-            Falls back to the ``GSKILL_AGENT_MODEL`` env var, then ``openai/gpt-5.2``.
+        agent_model: LiteLLM model string for mini-SWE-agent (e.g. ``openai/gpt-5.4``).
+            Falls back to the ``GSKILL_AGENT_MODEL`` env var, then ``openai/gpt-5.4``.
 
     Returns:
         Callable suitable for passing to ``optimize_anything(evaluator=...)``.
     """
     resolved_model = agent_model or os.environ.get(
-        "GSKILL_AGENT_MODEL", "openai/gpt-5.2"
+        "GSKILL_AGENT_MODEL", "openai/gpt-5.4"
     )
 
     def evaluate(candidate_skill: str, task: TaskSpec | dict) -> tuple[float, dict]:

@@ -33,7 +33,7 @@ It implements the pipeline described in the [GEPA blog post](https://gepa-ai.git
 - [uv](https://docs.astral.sh/uv/)
 - Docker (for running SWE-smith task environments)
 - `OPENAI_API_KEY` set in your environment (for initial skill generation and GEPA reflection)
-- `GSKILL_AGENT_MODEL` (optional) — LiteLLM model string for mini-SWE-agent (default: `openai/gpt-5.2`)
+- `GSKILL_AGENT_MODEL` (optional) — LiteLLM model string for mini-SWE-agent (default: `openai/gpt-5.4`)
 
 ## Installation
 
